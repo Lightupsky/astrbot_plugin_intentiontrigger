@@ -4,7 +4,9 @@
 
 在群里，用户无需 @ 机器人、无需唤醒前缀，直接说"鸭嘴兽，今天天气怎么样？"、"帮我查个航班"即可触发回复；而群友之间的日常闲聊不会浪费主 LLM 的调用。
 
-## v1.2.0 新特性
+## 更新日志
+
+### v1.2.0
 
 - **修复统计页不显示数据/手动测试报错**：bridge SDK 改为在 `<head>` 显式引用（AstrBot 自动注入发生在 `</body>` 前，晚于页面脚本执行导致 `window.AstrBotPluginPage` 为 undefined）。
 - **意图分类风格提示**：判定时附带 choice 问题将发言分类为 提问/闲聊/指令/玩梗，放行的消息把对应提示**追加到主 LLM 输入末尾**（不动 system prompt，不破坏前缀缓存），回复风格更贴合；文案可在配置中自定义，也可整体关闭。
@@ -12,15 +14,7 @@
 - **多行上下文测试**：`/intention test` 与统计页测试框支持多行输入（一行一条消息），按群聊上下文走池判定，与生产模式一致，不再误导调参。
 - **健壮性**：stats.jsonl 按行数轮转（默认 5000 行，保留最近一半）；平均延迟只统计成功调用；消息池定时器/判定流程补异常兜底，future 不再悬挂至超时。
 
-## v1.1.0 特性
-
-- **消息池模式（默认）**：每群攒 `pool_size`（默认 5）条消息、或超过 `flush_interval`（默认 5 秒）后，把整段对话上下文一次性交给 Jev，池内每条消息各得一个独立的 noul 概率（多问并行评估）。相比逐条判定：
-  - **API 调用次数降低约 5 倍**，从容应对 Jev 的 rate limit；
-  - **碎片消息判定更准**——实测"在吗在吗"（无上下文 0.52）→（带上下文 0.92）、"还是不好笑"（0.45 → 0.89）；
-  - `one_reply_per_flush`（默认开）：同一池内多条消息都达到阈值时只放行分数最高的一条，避免连珠炮式重复回复。
-- **WebUI 统计页**：插件页面 → `stats`，实时展示判定分数直方图（含阈值分割线）、触发率、平均延迟、按群统计、最近每次调用的明细，并支持在页面上手动输入文本试判定——调阈值不再靠猜。
-- **群白名单（必填）**：只对白名单内的群启用，留空时插件不对任何群生效（安全默认）。
-- **机器人称呼自定义**：`bot_names` 填"鸭嘴兽"等昵称，作为 bot 身份参与判定，称呼类消息识别的关键。
+完整版本历史见 [Changelog.md](Changelog.md)。
 
 ## 工作原理
 
@@ -101,6 +95,12 @@ WebUI → 插件 → astrbot_plugin_intentiontrigger → **stats** 页面：
 若不想依赖 TypeSafe API，可用开源的 [laya](https://huggingface.co/convaiinnovations/laya)（421M 参数、Apache 2.0、同为"typed decisions"架构）自建兼容服务，并通过 `api_base_url` 指向它（需自行实现 `/v1/systemone` 兼容层）。在 N100 + 16GB 内存设备上 CPU 推理完全可行（单次约 0.2~0.5 秒），但**零样本中文判定质量实测不佳**，建议攒数据微调后再迁移，详见 `docs/laya-local-deployment.md`。
 
 ## 开发
+
+> [!NOTE]
+> 本插件代码由 AI Agent（Vibe Coding，GLM via ZCode）与作者结对完成：
+> 需求拆解、架构设计、编码、测试与调试均由 Agent 主导，作者负责需求定义、
+> 关键决策与生产验收。历史版本的开发过程可从 commit 记录与
+> [Changelog.md](Changelog.md) 中追溯。
 
 - AstrBot 插件开发文档: <https://docs.astrbot.app/dev/star/plugin-new.html>
 - TypeSafe 文档: <https://docs.typesafe.ai/>
