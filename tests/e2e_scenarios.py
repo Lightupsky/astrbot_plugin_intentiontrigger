@@ -14,7 +14,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 ASTRBOT_ROOT = ROOT.parent / "AstrBot"
-sys.path.insert(0, str(ASTRBOT_ROOT))
+# 开发机上加本地 AstrBot 源码路径；生产环境直接用已安装的 astrbot 包
+if ASTRBOT_ROOT.exists():
+    sys.path.insert(0, str(ASTRBOT_ROOT))
 sys.path.insert(0, str(ROOT))
 
 from astrbot.core.config.astrbot_config import AstrBotConfig
