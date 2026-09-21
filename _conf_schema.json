@@ -1,0 +1,86 @@
+{
+  "enable": {
+    "description": "启用意图门控",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后机器人恢复 AstrBot 原生唤醒行为（仅 @/唤醒前缀/私聊触发）"
+  },
+  "api_key": {
+    "description": "TypeSafe API Key",
+    "type": "string",
+    "default": "",
+    "hint": "在 https://console.typesafe.ai/keys 获取；留空时尝试读取环境变量 TYPESAFE_API_KEY"
+  },
+  "api_base_url": {
+    "description": "TypeSafe API 地址",
+    "type": "string",
+    "default": "https://api.typesafe.ai",
+    "hint": "一般无需修改；若使用兼容代理可在此填写"
+  },
+  "model": {
+    "description": "模型名称",
+    "type": "string",
+    "default": "jev-latest",
+    "hint": "如 jev-latest 或指定版本 jev-1.13.0"
+  },
+  "threshold": {
+    "description": "触发阈值",
+    "type": "float",
+    "default": 0.5,
+    "hint": "noul 概率 ≥ 该值才交由主 LLM。调高更保守（少回复），调低更积极（多回复）"
+  },
+  "bot_names": {
+    "description": "机器人昵称/别名列表",
+    "type": "list",
+    "default": [],
+    "hint": "用于帮助模型识别发言者是否在称呼机器人，如 [\"小星\", \"starbot\"]；留空则使用机器人自身 ID"
+  },
+  "group_whitelist": {
+    "description": "群聊白名单",
+    "type": "list",
+    "default": [],
+    "hint": "留空表示对所有群生效；填写群号则仅对这些群做意图门控"
+  },
+  "group_blacklist": {
+    "description": "群聊黑名单",
+    "type": "list",
+    "default": [],
+    "hint": "这些群不做意图门控，保持原生行为"
+  },
+  "timeout_seconds": {
+    "description": "API 调用超时（秒）",
+    "type": "int",
+    "default": 10
+  },
+  "max_concurrency": {
+    "description": "并发调用上限",
+    "type": "int",
+    "default": 8,
+    "hint": "活跃群较多时可适当调大"
+  },
+  "on_error": {
+    "description": "API 调用失败时的策略",
+    "type": "string",
+    "default": "suppress",
+    "options": ["suppress", "pass_to_llm"],
+    "hint": "suppress：当作无意图处理（机器人保持安静，仅 @ 可唤醒）；pass_to_llm：放行给主 LLM（API 故障期间机器人会变得话多且花费增加）"
+  },
+  "custom_instructions": {
+    "description": "自定义判定指令（高级）",
+    "type": "text",
+    "default": "",
+    "hint": "覆盖默认的 noul 判定 instructions。慎改，改坏会导致漏判/误判"
+  },
+  "block_other_handlers": {
+    "description": "无意图时拦截其他插件",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后，被判定为无互动意图的群消息会终止传播，其他插件注册的群消息监听也不会触发。默认关闭以保持兼容"
+  },
+  "log_decisions": {
+    "description": "记录每条判定日志",
+    "type": "bool",
+    "default": false,
+    "hint": "调试用：在日志中输出每条群消息的判定分数与结果"
+  }
+}
