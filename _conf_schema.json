@@ -5,6 +5,31 @@
     "default": true,
     "hint": "关闭后机器人恢复 AstrBot 原生唤醒行为（仅 @/唤醒前缀/私聊触发）"
   },
+  "mode": {
+    "description": "判定模式",
+    "type": "string",
+    "default": "pool",
+    "options": ["pool", "single"],
+    "hint": "pool（推荐）：每群攒 pool_size 条（或超时 flush_interval 秒）后带完整上下文一次判定，省 API 调用且能理解碎片消息；single：逐条即时判定，响应快但调用多、无上下文"
+  },
+  "pool_size": {
+    "description": "消息池大小（pool 模式）",
+    "type": "int",
+    "default": 5,
+    "hint": "攒够多少条群消息触发一次 Jev 判定。越大越省 API 调用，但回复延迟增加"
+  },
+  "flush_interval": {
+    "description": "消息池超时（秒，pool 模式）",
+    "type": "int",
+    "default": 5,
+    "hint": "群消息不够 pool_size 条时，最多等待多少秒就强制判定一次，避免冷群消息悬置"
+  },
+  "one_reply_per_flush": {
+    "description": "同一池只回复一条",
+    "type": "bool",
+    "default": true,
+    "hint": "一次批量判定中若多条消息都达到阈值，只放行分数最高的一条给主 LLM，避免连珠炮式重复回复"
+  },
   "api_key": {
     "description": "TypeSafe API Key",
     "type": "string",
@@ -27,30 +52,30 @@
     "description": "触发阈值",
     "type": "float",
     "default": 0.5,
-    "hint": "noul 概率 ≥ 该值才交由主 LLM。调高更保守（少回复），调低更积极（多回复）"
+    "hint": "noul 概率 ≥ 该值才交由主 LLM。调高更保守（少回复），调低更积极（多回复）。建议配合统计页的分数直方图调整"
   },
   "bot_names": {
-    "description": "机器人昵称/别名列表",
+    "description": "机器人称呼/昵称列表",
     "type": "list",
     "default": [],
-    "hint": "用于帮助模型识别发言者是否在称呼机器人，如 [\"小星\", \"starbot\"]；留空则使用机器人自身 ID"
+    "hint": "群友怎么叫你的机器人就填什么，如 [\"鸭嘴兽\", \"鸭鸭\"]。会作为 bot 身份提供给 Jev 判定，对识别称呼类消息至关重要；留空则使用机器人自身 ID"
   },
   "group_whitelist": {
-    "description": "群聊白名单",
+    "description": "群聊白名单（必填）",
     "type": "list",
     "default": [],
-    "hint": "留空表示对所有群生效；填写群号则仅对这些群做意图门控"
+    "hint": "只对这些群启用意图门控；留空时插件不对任何群生效！请填写群号"
   },
   "group_blacklist": {
     "description": "群聊黑名单",
     "type": "list",
     "default": [],
-    "hint": "这些群不做意图门控，保持原生行为"
+    "hint": "优先级高于白名单，这些群不做意图门控"
   },
   "timeout_seconds": {
     "description": "API 调用超时（秒）",
     "type": "int",
-    "default": 10
+    "default": 15
   },
   "max_concurrency": {
     "description": "并发调用上限",

@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>意图触发器统计</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --text: #1f2328; --muted: #6a737d;
+    --border: #e1e4e8; --accent: #4f6ef7; --ok: #1a9c5b; --bad: #d8434f;
+    --bar: #4f6ef7; --chip: #eef1fd;
+  }
+  html[data-theme="dark"] {
+    --bg: #14161a; --card: #1d2026; --text: #e6e8eb; --muted: #9aa1ab;
+    --border: #2d323b; --accent: #7b93ff; --ok: #35c07f; --bad: #f0777f;
+    --bar: #7b93ff; --chip: #262b38;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px; background: var(--bg); color: var(--text);
+    font: 14px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  h1 { font-size: 17px; margin: 0 0 2px; }
+  .sub { color: var(--muted); font-size: 12px; margin-bottom: 14px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; margin-bottom: 14px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; }
+  .card .k { color: var(--muted); font-size: 12px; }
+  .card .v { font-size: 22px; font-weight: 600; margin-top: 2px; }
+  .panel { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; margin-bottom: 14px; }
+  .panel h2 { font-size: 14px; margin: 0 0 10px; }
+  .histo { display: flex; align-items: flex-end; gap: 4px; height: 120px; padding-top: 4px; }
+  .histo .bin { flex: 1; display: flex; flex-direction: column; justify-content: flex-end; height: 100%; position: relative; }
+  .histo .bar { background: var(--bar); border-radius: 3px 3px 0 0; min-height: 2px; transition: height .3s; }
+  .histo .bar.hot { background: var(--ok); }
+  .histo .lbl { text-align: center; color: var(--muted); font-size: 10px; margin-top: 4px; }
+  .histo .cnt { text-align: center; font-size: 10px; color: var(--muted); margin-bottom: 2px; }
+  .threshold-line { position: absolute; top: -18px; bottom: 0; border-left: 2px dashed var(--bad); }
+  .threshold-tag { position: absolute; top: -18px; left: 50%; transform: translateX(-50%); color: var(--bad); font-size: 10px; white-space: nowrap; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  .chip { display: inline-block; padding: 0 8px; border-radius: 999px; background: var(--chip); color: var(--accent); font-size: 12px; }
+  .chip.ok { color: var(--ok); }
+  .score { font-variant-numeric: tabular-nums; font-weight: 600; }
+  .score.trig { color: var(--ok); }
+  .call { border: 1px solid var(--border); border-radius: 8px; margin-bottom: 8px; overflow: hidden; }
+  .call-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 8px 12px; cursor: pointer; user-select: none; }
+  .call-body { display: none; border-top: 1px solid var(--border); padding: 4px 12px 8px; }
+  .call.open .call-body { display: block; }
+  .call-head .time { color: var(--muted); font-size: 12px; margin-left: auto; }
+  .msg-row { display: flex; gap: 10px; padding: 5px 0; border-bottom: 1px dashed var(--border); font-size: 13px; }
+  .msg-row:last-child { border-bottom: none; }
+  .msg-row .who { color: var(--muted); min-width: 72px; flex-shrink: 0; }
+  .msg-row .txt { flex: 1; word-break: break-all; }
+  .testbox { display: flex; gap: 8px; }
+  .testbox input { flex: 1; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); font-size: 13px; }
+  button { padding: 8px 14px; border: none; border-radius: 8px; background: var(--accent); color: #fff; cursor: pointer; font-size: 13px; }
+  button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--border); }
+  .test-result { margin-top: 8px; font-size: 13px; }
+  .empty { color: var(--muted); text-align: center; padding: 18px 0; }
+  .toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; }
+  .toolbar .grow { flex: 1; }
+  .err { color: var(--bad); }
+</style>
+</head>
+<body>
+  <h1>意图触发器统计</h1>
+  <div class="sub">Jev 判定调用监控 · 阈值调优参考（数据为最近 300 次调用）</div>
+
+  <div class="cards" id="cards"></div>
+
+  <div class="panel">
+    <h2>判定分数分布（noul 概率）</h2>
+    <div class="histo" id="histo"></div>
+    <div class="sub" style="margin:8px 0 0">绿色 = 当前阈值下会触发的区间；虚线 = 当前阈值 <span id="th-val"></span>。理想分布应两侧分明，中间重叠多说明阈值难切分，可考虑调整 bot 称呼配置或换 pool 模式。</div>
+  </div>
+
+  <div class="panel">
+    <h2>手动判定测试</h2>
+    <div class="testbox">
+      <input id="test-input" placeholder="输入一条模拟群消息，如：鸭嘴兽在吗" maxlength="200">
+      <button id="test-btn">判定</button>
+    </div>
+    <div class="test-result" id="test-result"></div>
+  </div>
+
+  <div class="panel">
+    <h2>按群统计</h2>
+    <table><thead><tr><th>群号</th><th>调用次数</th><th>消息数</th><th>触发</th><th>触发率</th></tr></thead>
+    <tbody id="group-body"></tbody></table>
+    <div class="empty" id="group-empty" style="display:none">暂无数据</div>
+  </div>
+
+  <div class="panel">
+    <div class="toolbar">
+      <h2 style="margin:0">最近调用</h2>
+      <div class="grow"></div>
+      <button class="ghost" id="refresh-btn">刷新</button>
+    </div>
+    <div id="calls"></div>
+    <div class="empty" id="calls-empty" style="display:none">暂无调用记录 — 白名单群产生消息后此处会出现记录</div>
+  </div>
+
+<script>
+const bridge = window.AstrBotPluginPage;
+
+function fmtTime(ts) {
+  const d = new Date(ts * 1000);
+  const p = (x) => String(x).padStart(2, "0");
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function renderOverview(d) {
+  const t = d.totals, c = d.config;
+  document.getElementById("th-val").textContent = c.threshold;
+  const cards = [
+    ["API 调用", t.calls ?? 0],
+    ["判定消息", t.messages ?? 0],
+    ["触发给 LLM", t.triggered ?? 0],
+    ["触发率", t.trigger_rate == null ? "—" : (t.trigger_rate * 100).toFixed(1) + "%"],
+    ["平均耗时", t.avg_latency_ms == null ? "—" : t.avg_latency_ms + " ms"],
+    ["错误", t.errors ?? 0],
+    ["模式", c.mode === "pool" ? `池 ${c.pool_size} 条` : "单条"],
+    ["机器人称呼", c.bot_names.length ? esc(c.bot_names.join(" / ")) : "未配置"],
+  ];
+  document.getElementById("cards").innerHTML = cards
+    .map(([k, v]) => `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`)
+    .join("");
+
+  // 直方图
+  const bins = d.score_histogram.bins, counts = d.score_histogram.counts;
+  const maxC = Math.max(1, ...counts);
+  const th = c.threshold;
+  document.getElementById("histo").innerHTML = bins.map((b, i) => {
+    const hot = (i + 1) / 10 > th ? " hot" : "";
+    const isThBin = Math.floor(th * 10) === i;
+    const line = isThBin
+      ? `<div class="threshold-line" style="left:${((th * 10 - i) * 100).toFixed(0)}%"></div>
+         <div class="threshold-tag" style="left:${((th * 10 - i) * 100).toFixed(0)}%">阈值 ${th}</div>`
+      : "";
+    return `<div class="bin">${line}
+      <div class="cnt">${counts[i] || ""}</div>
+      <div class="bar${hot}" style="height:${Math.round((counts[i] || 0) / maxC * 100)}%"></div>
+      <div class="lbl">${b.replace("-0.", "-.")}</div></div>`;
+  }).join("");
+
+  // 按群
+  const gb = document.getElementById("group-body");
+  if (!d.by_group.length) {
+    document.getElementById("group-empty").style.display = "";
+    gb.innerHTML = "";
+  } else {
+    document.getElementById("group-empty").style.display = "none";
+    gb.innerHTML = d.by_group.map((g) => {
+      const rate = g.messages ? (g.triggered / g.messages * 100).toFixed(1) + "%" : "—";
+      return `<tr><td>${esc(g.group_id)}</td><td>${g.calls}</td><td>${g.messages}</td>
+        <td>${g.triggered}</td><td>${rate}</td></tr>`;
+    }).join("");
+  }
+}
+
+function renderCalls(items) {
+  const box = document.getElementById("calls");
+  if (!items.length) {
+    document.getElementById("calls-empty").style.display = "";
+    box.innerHTML = "";
+    return;
+  }
+  document.getElementById("calls-empty").style.display = "none";
+  box.innerHTML = items.map((r, idx) => {
+    const msgHtml = r.messages.map((m) => {
+      const sc = m.noul == null ? '<span class="err">错误</span>'
+        : `<span class="score${m.triggered ? " trig" : ""}">${m.noul.toFixed(3)}</span>`;
+      const flag = m.triggered ? '<span class="chip ok">✅ 放行</span>' : '<span class="chip">⛔ 抑制</span>';
+      return `<div class="msg-row"><span class="who">${esc(m.sender)}</span>
+        <span class="txt">${esc(m.text)}</span><span>${sc}</span><span>${flag}</span></div>`;
+    }).join("");
+    const errTag = r.error ? ` <span class="err">错误: ${esc(r.error).slice(0, 80)}</span>` : "";
+    return `<div class="call" id="call-${idx}">
+      <div class="call-head" onclick="document.getElementById('call-${idx}').classList.toggle('open')">
+        <span class="chip">群 ${esc(r.group_id)}</span>
+        <span>${r.messages.length} 条消息</span>
+        <span>${r.messages.filter((m) => m.triggered).length} 条放行</span>
+        <span>${r.mode === "pool" ? "池判定" : "单条"} · ${r.latency_ms}ms</span>${errTag}
+        <span class="time">${fmtTime(r.ts)}</span>
+      </div>
+      <div class="call-body">${msgHtml}</div>
+    </div>`;
+  }).join("");
+}
+
+async function refresh() {
+  try {
+    const [ov, recent] = await Promise.all([
+      bridge.apiGet("stats/overview"),
+      bridge.apiGet("stats/recent", { limit: 50 }),
+    ]);
+    renderOverview(ov);
+    renderCalls(Array.isArray(recent) ? recent : []);
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+document.getElementById("refresh-btn").onclick = refresh;
+document.getElementById("test-btn").onclick = async () => {
+  const text = document.getElementById("test-input").value.trim();
+  const out = document.getElementById("test-result");
+  if (!text) return;
+  out.textContent = "判定中…";
+  try {
+    const r = await bridge.apiPost("stats/test", { text });
+    out.innerHTML = `noul = <b>${r.noul.toFixed(4)}</b>（阈值 ${r.threshold}，${r.latency_ms}ms）→ ${
+      r.triggered ? '<span style="color:var(--ok)">✅ 会触发主 LLM</span>'
+                  : '<span style="color:var(--muted)">⛔ 不会触发</span>'}`;
+    refresh();
+  } catch (e) {
+    out.innerHTML = `<span class="err">调用失败: ${esc(e.message || e)}</span>`;
+  }
+};
+document.getElementById("test-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") document.getElementById("test-btn").click();
+});
+
+(async () => {
+  await bridge.ready();
+  const ctx = bridge.getContext();
+  document.documentElement.dataset.theme = ctx?.isDark ? "dark" : "light";
+  bridge.onContext((c) => { document.documentElement.dataset.theme = c?.isDark ? "dark" : "light"; });
+  await refresh();
+  setInterval(refresh, 30000);
+})();
+</script>
+</body>
+</html>
