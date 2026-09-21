@@ -4,6 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>意图触发器统计</title>
+<!-- 显式引用 bridge SDK：AstrBot 会将该 URL 重写为带鉴权的地址并同步加载，
+     确保早于页面内联脚本执行（自动注入发生在 </body> 前，晚于内联脚本，
+     会导致 window.AstrBotPluginPage 为 undefined） -->
+<script src="/api/plugin/page/bridge-sdk.js"></script>
 <style>
   :root {
     --bg: #f6f7f9; --card: #ffffff; --text: #1f2328; --muted: #6a737d;
@@ -25,7 +29,7 @@
   .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; margin-bottom: 14px; }
   .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; }
   .card .k { color: var(--muted); font-size: 12px; }
-  .card .v { font-size: 22px; font-weight: 600; margin-top: 2px; }
+  .card .v { font-size: 22px; font-weight: 600; margin-top: 2px; word-break: break-all; }
   .panel { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; margin-bottom: 14px; }
   .panel h2 { font-size: 14px; margin: 0 0 10px; }
   .histo { display: flex; align-items: flex-end; gap: 4px; height: 120px; padding-top: 4px; }
@@ -41,6 +45,7 @@
   th { color: var(--muted); font-weight: 500; font-size: 12px; }
   .chip { display: inline-block; padding: 0 8px; border-radius: 999px; background: var(--chip); color: var(--accent); font-size: 12px; }
   .chip.ok { color: var(--ok); }
+  .chip.cat { background: transparent; border: 1px solid var(--border); color: var(--muted); }
   .score { font-variant-numeric: tabular-nums; font-weight: 600; }
   .score.trig { color: var(--ok); }
   .call { border: 1px solid var(--border); border-radius: 8px; margin-bottom: 8px; overflow: hidden; }
@@ -52,8 +57,12 @@
   .msg-row:last-child { border-bottom: none; }
   .msg-row .who { color: var(--muted); min-width: 72px; flex-shrink: 0; }
   .msg-row .txt { flex: 1; word-break: break-all; }
-  .testbox { display: flex; gap: 8px; }
-  .testbox input { flex: 1; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); font-size: 13px; }
+  .testbox textarea {
+    width: 100%; min-height: 88px; padding: 8px 10px; border: 1px solid var(--border);
+    border-radius: 8px; background: var(--bg); color: var(--text); font-size: 13px;
+    font-family: inherit; resize: vertical;
+  }
+  .test-actions { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
   button { padding: 8px 14px; border: none; border-radius: 8px; background: var(--accent); color: #fff; cursor: pointer; font-size: 13px; }
   button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--border); }
   .test-result { margin-top: 8px; font-size: 13px; }
@@ -61,11 +70,12 @@
   .toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; }
   .toolbar .grow { flex: 1; }
   .err { color: var(--bad); }
+  .catrow { display: flex; flex-wrap: wrap; gap: 8px; }
 </style>
 </head>
 <body>
   <h1>意图触发器统计</h1>
-  <div class="sub">Jev 判定调用监控 · 阈值调优参考（数据为最近 300 次调用）</div>
+  <div class="sub">Jev 判定调用监控 · 阈值调优参考（面板数据为最近 300 次调用）</div>
 
   <div class="cards" id="cards"></div>
 
@@ -76,10 +86,25 @@
   </div>
 
   <div class="panel">
+    <h2>估算花费</h2>
+    <div class="cards" id="cost-cards" style="margin-bottom:0"></div>
+    <div class="sub" style="margin:8px 0 0" id="cost-note"></div>
+  </div>
+
+  <div class="panel">
+    <h2>意图分类分布</h2>
+    <div class="catrow" id="cats"></div>
+    <div class="sub" style="margin:8px 0 0">分类在放行时会作为风格提示追加给主 LLM（可在配置中关闭或改文案）。</div>
+  </div>
+
+  <div class="panel">
     <h2>手动判定测试</h2>
     <div class="testbox">
-      <input id="test-input" placeholder="输入一条模拟群消息，如：鸭嘴兽在吗" maxlength="200">
-      <button id="test-btn">判定</button>
+      <textarea id="test-input" placeholder="单行 = 单条判定；多行（每行一条消息）= 按群聊上下文走池判定，与生产模式一致。&#10;例如：&#10;这游戏也太难了吧&#10;鸭嘴兽在吗&#10;在吗在吗"></textarea>
+      <div class="test-actions">
+        <button id="test-btn">判定</button>
+        <span class="sub" style="margin:0">多行时每行各出分数</span>
+      </div>
     </div>
     <div class="test-result" id="test-result"></div>
   </div>
@@ -102,7 +127,23 @@
   </div>
 
 <script>
-const bridge = window.AstrBotPluginPage;
+// bridge SDK 由 <head> 中的显式 script 同步加载；仍做防御性等待，
+// 兼容 SDK 注入晚于本脚本执行的环境。
+let bridge = window.AstrBotPluginPage || null;
+
+async function waitBridge(timeoutMs = 8000) {
+  const t0 = Date.now();
+  while (!window.AstrBotPluginPage && Date.now() - t0 < timeoutMs) {
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  bridge = window.AstrBotPluginPage || null;
+  return bridge;
+}
+
+const CAT_NAMES = {
+  question: "提问", chitchat: "闲聊", command: "指令", meme: "玩梗",
+  not_addressed: "非对bot",
+};
 
 function fmtTime(ts) {
   const d = new Date(ts * 1000);
@@ -115,14 +156,14 @@ function esc(s) {
 }
 
 function renderOverview(d) {
-  const t = d.totals, c = d.config;
+  const t = d.totals, c = d.config, cost = d.costs || {};
   document.getElementById("th-val").textContent = c.threshold;
   const cards = [
     ["API 调用", t.calls ?? 0],
     ["判定消息", t.messages ?? 0],
     ["触发给 LLM", t.triggered ?? 0],
     ["触发率", t.trigger_rate == null ? "—" : (t.trigger_rate * 100).toFixed(1) + "%"],
-    ["平均耗时", t.avg_latency_ms == null ? "—" : t.avg_latency_ms + " ms"],
+    ["平均耗时(成功)", t.avg_latency_ms == null ? "—" : t.avg_latency_ms + " ms"],
     ["错误", t.errors ?? 0],
     ["模式", c.mode === "pool" ? `池 ${c.pool_size} 条` : "单条"],
     ["机器人称呼", c.bot_names.length ? esc(c.bot_names.join(" / ")) : "未配置"],
@@ -130,6 +171,29 @@ function renderOverview(d) {
   document.getElementById("cards").innerHTML = cards
     .map(([k, v]) => `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`)
     .join("");
+
+  // 花费面板
+  const fmtTok = (n) => n >= 1e6 ? (n / 1e6).toFixed(2) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n);
+  const costCards = [
+    ["输入 tokens", fmtTok(cost.input_tokens ?? 0)],
+    ["输出 tokens", fmtTok(cost.output_tokens ?? 0)],
+    ["估算花费", "$" + (cost.est_cost_usd ?? 0).toFixed(4)],
+    ["单价(入/出 $/Mtok)", `${cost.price_per_mtok_input ?? "?"} / ${cost.price_per_mtok_output ?? "?"}`],
+  ];
+  document.getElementById("cost-cards").innerHTML = costCards
+    .map(([k, v]) => `<div class="card"><div class="k">${k}</div><div class="v" style="font-size:17px">${v}</div></div>`)
+    .join("");
+  document.getElementById("cost-note").textContent = cost.note || "";
+
+  // 分类分布
+  const cats = d.categories || {};
+  const catTotal = Object.values(cats).reduce((a, b) => a + b, 0);
+  document.getElementById("cats").innerHTML = catTotal
+    ? Object.entries(cats)
+        .sort((a, b) => b[1] - a[1])
+        .map(([k, v]) => `<span class="chip">${CAT_NAMES[k] || k} · ${v} (${(v / catTotal * 100).toFixed(0)}%)</span>`)
+        .join("")
+    : '<span class="sub">暂无分类数据（需开启 enable_category_hint 且产生判定）</span>';
 
   // 直方图
   const bins = d.score_histogram.bins, counts = d.score_histogram.counts;
@@ -176,16 +240,19 @@ function renderCalls(items) {
       const sc = m.noul == null ? '<span class="err">错误</span>'
         : `<span class="score${m.triggered ? " trig" : ""}">${m.noul.toFixed(3)}</span>`;
       const flag = m.triggered ? '<span class="chip ok">✅ 放行</span>' : '<span class="chip">⛔ 抑制</span>';
+      const cat = m.category && CAT_NAMES[m.category]
+        ? ` <span class="chip cat">${CAT_NAMES[m.category]}</span>` : "";
       return `<div class="msg-row"><span class="who">${esc(m.sender)}</span>
-        <span class="txt">${esc(m.text)}</span><span>${sc}</span><span>${flag}</span></div>`;
+        <span class="txt">${esc(m.text)}</span><span>${sc}</span><span>${flag}${cat}</span></div>`;
     }).join("");
     const errTag = r.error ? ` <span class="err">错误: ${esc(r.error).slice(0, 80)}</span>` : "";
+    const modeName = r.mode === "pool" ? "池判定" : r.mode === "multi" ? "多行测试" : "单条";
     return `<div class="call" id="call-${idx}">
       <div class="call-head" onclick="document.getElementById('call-${idx}').classList.toggle('open')">
         <span class="chip">群 ${esc(r.group_id)}</span>
         <span>${r.messages.length} 条消息</span>
         <span>${r.messages.filter((m) => m.triggered).length} 条放行</span>
-        <span>${r.mode === "pool" ? "池判定" : "单条"} · ${r.latency_ms}ms</span>${errTag}
+        <span>${modeName} · ${r.latency_ms}ms</span>${errTag}
         <span class="time">${fmtTime(r.ts)}</span>
       </div>
       <div class="call-body">${msgHtml}</div>
@@ -194,6 +261,11 @@ function renderCalls(items) {
 }
 
 async function refresh() {
+  if (!bridge) await waitBridge();
+  if (!bridge) {
+    console.error("AstrBotPluginPage bridge 不可用");
+    return;
+  }
   try {
     const [ov, recent] = await Promise.all([
       bridge.apiGet("stats/overview"),
@@ -211,26 +283,38 @@ document.getElementById("test-btn").onclick = async () => {
   const text = document.getElementById("test-input").value.trim();
   const out = document.getElementById("test-result");
   if (!text) return;
+  if (!bridge) await waitBridge();
+  if (!bridge) {
+    out.innerHTML = '<span class="err">bridge 不可用，无法调用</span>';
+    return;
+  }
   out.textContent = "判定中…";
   try {
     const r = await bridge.apiPost("stats/test", { text });
-    out.innerHTML = `noul = <b>${r.noul.toFixed(4)}</b>（阈值 ${r.threshold}，${r.latency_ms}ms）→ ${
-      r.triggered ? '<span style="color:var(--ok)">✅ 会触发主 LLM</span>'
-                  : '<span style="color:var(--muted)">⛔ 不会触发</span>'}`;
+    const rows = (r.messages || []).map((m, i) => {
+      const cat = m.category && CAT_NAMES[m.category] ? ` <span class="chip cat">${CAT_NAMES[m.category]}</span>` : "";
+      const verdict = m.triggered
+        ? '<span style="color:var(--ok)">✅ 触发</span>'
+        : '<span style="color:var(--muted)">⛔ 抑制</span>';
+      return `<div class="msg-row"><span class="who">#${i + 1}</span>
+        <span class="txt">${esc(m.text)}</span>
+        <span class="score${m.triggered ? " trig" : ""}">${m.noul.toFixed(3)}</span>
+        <span>${verdict}${cat}</span></div>`;
+    }).join("");
+    out.innerHTML = `<div class="sub" style="margin:4px 0">模式: ${r.mode} · ${r.latency_ms}ms · 阈值 ${r.threshold}</div>${rows}`;
     refresh();
   } catch (e) {
     out.innerHTML = `<span class="err">调用失败: ${esc(e.message || e)}</span>`;
   }
 };
-document.getElementById("test-input").addEventListener("keydown", (e) => {
-  if (e.key === "Enter") document.getElementById("test-btn").click();
-});
 
 (async () => {
-  await bridge.ready();
-  const ctx = bridge.getContext();
-  document.documentElement.dataset.theme = ctx?.isDark ? "dark" : "light";
-  bridge.onContext((c) => { document.documentElement.dataset.theme = c?.isDark ? "dark" : "light"; });
+  await waitBridge();
+  if (bridge) {
+    const ctx = bridge.getContext();
+    document.documentElement.dataset.theme = ctx?.isDark ? "dark" : "light";
+    bridge.onContext((c) => { document.documentElement.dataset.theme = c?.isDark ? "dark" : "light"; });
+  }
   await refresh();
   setInterval(refresh, 30000);
 })();

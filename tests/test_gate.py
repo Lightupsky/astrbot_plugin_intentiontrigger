@@ -11,6 +11,7 @@ import asyncio
 import json
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,8 +33,10 @@ FAIL = []
 
 # mock 服务返回的每条消息 noul 值（池模式下按索引取）
 POOL_NOUL = [0.9, 0.1, 0.8, 0.2, 0.7]
+POOL_CAT = ["question", "chitchat", "command", "meme", "not_addressed"]
 SINGLE_NOUL = {"v": 0.9}
 CALLS = {"n": 0}  # API 调用计数
+USAGE = {"input_tokens": 321, "output_tokens": 12}
 
 
 class FakeEvent:
@@ -49,6 +52,13 @@ class FakeEvent:
         self._group = group
         self._group_id = group_id
         self._sender_name = sender_name
+        self._extras: dict = {}
+
+    def set_extra(self, key, value):
+        self._extras[key] = value
+
+    def get_extra(self, key, default=None):
+        return self._extras.get(key, default)
 
     def get_message_type(self):
         return MessageType.GROUP_MESSAGE if self._group else MessageType.FRIEND_MESSAGE
@@ -86,18 +96,31 @@ async def fake_systemone(request: web.Request) -> web.Response:
     CALLS["n"] += 1
     answers = {}
     for key, q in body["questions"].items():
-        if q["type"] != "noul":
-            raise AssertionError("只应使用 noul 问题")
-        if key == "wants_interaction":
-            answers[key] = {"type": "noul", "noul": SINGLE_NOUL["v"]}
-        else:  # 池模式 msg_i
-            i = int(key.split("_")[1])
-            answers[key] = {"type": "noul", "noul": POOL_NOUL[i]}
+        if q["type"] == "noul":
+            if key == "wants_interaction":
+                answers[key] = {"type": "noul", "noul": SINGLE_NOUL["v"]}
+            else:  # 池模式 msg_i
+                i = int(key.split("_")[1])
+                answers[key] = {"type": "noul", "noul": POOL_NOUL[i]}
+        elif q["type"] == "choice":
+            if key == "intent_category":
+                answers[key] = {
+                    "type": "choice",
+                    "choice": "question",
+                    "probabilities": {"question": 1.0},
+                }
+            else:  # 池模式 cat_i
+                i = int(key.split("_")[1])
+                answers[key] = {
+                    "type": "choice",
+                    "choice": POOL_CAT[i],
+                    "probabilities": {POOL_CAT[i]: 1.0},
+                }
     return web.json_response(
         {
             "model": "jev-test",
             "answers": answers,
-            "usage": {"input_tokens": 10, "output_tokens": 2},
+            "usage": USAGE,
         }
     )
 
@@ -174,6 +197,31 @@ async def main() -> int:
           str(plugin.stats))
     check("池模式: 统计调用记录 1 条含 5 条消息",
           len(plugin.recent_calls) == 1 and len(plugin.recent_calls[-1].messages) == 5)
+    check("池模式: usage 已入库", plugin.recent_calls[-1].usage == USAGE)
+    check("池模式: 分类已入库", plugin.recent_calls[-1].messages[0].get("category") == "question")
+    check("池模式: 放行消息带分类 extra",
+          events[0].get_extra("intention_category") == "question")
+    check("池模式: 抑制消息不带分类 extra",
+          events[1].get_extra("intention_category") is None)
+
+    # ---------------- on_llm_request 风格提示追加 ----------------
+    class FakeReq:
+        def __init__(self):
+            self.prompt = "原始用户消息"
+            self.system_prompt = "系统提示"
+
+    req = FakeReq()
+    await plugin.inject_category_hint(FakeEvent(at_bot=True), req)
+    check("llm 钩子: 无 extra 时不改 prompt", req.prompt == "原始用户消息")
+    ev_hint = FakeEvent()
+    ev_hint.set_extra("intention_category", "meme")
+    req2 = FakeReq()
+    await plugin.inject_category_hint(ev_hint, req2)
+    check("llm 钩子: 追加提示到 prompt 末尾",
+          req2.prompt.startswith("原始用户消息") and "玩梗" in req2.prompt)
+    check("llm 钩子: 不动 system prompt", req2.system_prompt == "系统提示")
+    await plugin.inject_category_hint(ev_hint, req2)
+    check("llm 钩子: 重入不重复追加", req2.prompt.count("意图提示") == 1)
 
     # ---------------- 池模式: 不足 pool_size 条走超时 flush ----------------
     POOL_NOUL[:] = [0.05, 0.05, 0.05]
@@ -243,6 +291,51 @@ async def main() -> int:
     check("overview: 含配置与直方图", "config" in ov and "score_histogram" in ov
           and "totals" in ov)
     check("overview: bot_names 正确", ov["config"]["bot_names"] == ["鸭嘴兽"])
+    check("overview: 含花费估算与分类分布",
+          "costs" in ov and "categories" in ov and ov["costs"]["est_cost_usd"] > 0)
+
+    # ---------------- 平均延迟排除错误记录 ----------------
+    err_rec = plugin_module._CallRecord(
+        ts=time.time(), group_id="g", mode="pool", latency_ms=15000.0,
+        model="m", usage={}, messages=[{"text": "x", "sender": "s", "noul": None,
+                                        "triggered": False}], error="timeout")
+    p8.recent_calls.append(err_rec)
+    ov2 = p8._overview()
+    ok_lat = [r.latency_ms for r in p8.recent_calls if not r.error]
+    check("overview: 平均延迟只统计成功调用",
+          abs(ov2["totals"]["avg_latency_ms"] - round(sum(ok_lat) / len(ok_lat), 1)) < 0.01,
+          f"{ov2['totals']['avg_latency_ms']}")
+
+    # ---------------- 多行判定测试（与生产池判定一致） ----------------
+    POOL_NOUL[:] = [0.1, 0.95, 0.2]
+    POOL_CAT[:] = ["chitchat", "question", "not_addressed"]
+    CALLS["n"] = 0
+    msgs, usage = await p8._judge_test_text("这游戏好难\n鸭嘴兽在吗\n走了走了")
+    check("多行测试: 走池判定一次调用", CALLS["n"] == 1)
+    check("多行测试: 每行各出分数",
+          [round(m["noul"], 2) for m in msgs] == [0.1, 0.95, 0.2])
+    check("多行测试: 每行带分类", msgs[1]["category"] == "question")
+    check("多行测试: usage 返回", usage == USAGE)
+    SINGLE_NOUL["v"] = 0.42
+    msgs1, _ = await p8._judge_test_text("单行消息")
+    check("单行测试: 走 single 判定", len(msgs1) == 1 and msgs1[0]["noul"] == 0.42)
+
+    # ---------------- stats.jsonl 轮转 ----------------
+    import tempfile as _tf
+    from pathlib import Path as _Path
+    rot_file = _Path(_tf.mktemp(suffix=".jsonl"))
+    rot_file.write_text("line\n" * 10, encoding="utf-8")
+    p8._stats_file = rot_file
+    p8._stats_lines = 10
+    p8.config["stats_max_lines"] = 10
+    p8._record(plugin_module._CallRecord(
+        ts=time.time(), group_id="g", mode="pool", latency_ms=1.0, model="m",
+        usage={}, messages=[], error=None))
+    content_lines = rot_file.read_text(encoding="utf-8").strip().splitlines()
+    check("轮转: 超限时保留最近一半+新记录", len(content_lines) == 6,
+          f"{len(content_lines)} 行")
+    check("轮转: 计数已重置", p8._stats_lines == 6)
+    p8._stats_file = None
 
     for p in _PLUGINS:
         await p.terminate()

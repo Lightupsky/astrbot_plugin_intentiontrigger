@@ -158,7 +158,7 @@ async def main() -> int:
                 "message": text,
             }
             try:
-                score = await plugin._judge_single(state)
+                score, _cat, _usage = await plugin._judge_single(state)
             except Exception as e:
                 print(f"  single 调用失败: {e}")
                 score = None
@@ -175,7 +175,7 @@ async def main() -> int:
             ],
         }
         try:
-            scores = await plugin._judge_pool(state, len(msgs))
+            scores, cats, usage = await plugin._judge_pool(state, len(msgs))
         except Exception as e:
             print(f"  pool 调用失败: {e}")
             scores = [None] * len(msgs)

@@ -1,6 +1,6 @@
 name: astrbot_plugin_intentiontrigger
 display_name: 意图触发器 (Jev)
 desc: 利用 TypeSafe Jev 模型识别群聊互动意图，仅在有人想和机器人互动时才唤起主 LLM。
-version: v1.1.0
+version: v1.2.0
 author: Lightupsky
 repo: https://github.com/Lightupsky/astrbot_plugin_intentiontrigger

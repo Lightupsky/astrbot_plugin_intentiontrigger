@@ -66,6 +66,24 @@ DEFAULT_CRITERIA = {
     ),
 }
 
+# 意图分类（choice 问题）的选项与判定标准
+CATEGORY_CRITERIA = {
+    "question": "The speaker asks the bot for information, help, or an answer.",
+    "chitchat": "The speaker is casually chatting, greeting, or socializing with the bot.",
+    "command": "The speaker orders or asks the bot to perform a task or action.",
+    "meme": "The speaker is joking, teasing, meme-feeding, or playfully provoking the bot.",
+    "not_addressed": "The message is not aimed at the bot at all (human-to-human chat).",
+}
+
+# 分类 → 追加到主 LLM 输入末尾的风格提示（可通过 category_hints 配置覆盖）
+DEFAULT_CATEGORY_HINTS = {
+    "question": "[意图提示] 用户这条消息是在向你提问/求助，请直接、清晰地解答。",
+    "chitchat": "[意图提示] 用户在和你闲聊寒暄，回复轻松简短即可，不必长篇大论。",
+    "command": "[意图提示] 用户在对你下达指令/任务，请执行并把结果汇报给用户。",
+    "meme": "[意图提示] 用户在玩梗/逗弄你，可以放松、幽默地接梗。",
+    "not_addressed": "",
+}
+
 # 模块级状态：插件实例在 __init__ 时注册自己，供自定义 filter 读取。
 # filter 在 WakingCheckStage 中同步执行，必须轻量且永不抛异常。
 _GATE_STATE: dict = {"impl": None}
@@ -125,7 +143,7 @@ class _CallRecord:
     "astrbot_plugin_intentiontrigger",
     "Lightupsky",
     "利用 Jev 模型识别群聊互动意图，仅在有人想和机器人互动时才唤起主 LLM",
-    "1.1.0",
+    "1.2.0",
 )
 class IntentionTrigger(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -146,6 +164,7 @@ class IntentionTrigger(Star):
         self.recent_calls: deque[_CallRecord] = deque(maxlen=RECENT_CALLS_MAX)
         self.stats = {"checked": 0, "triggered": 0, "suppressed": 0, "errors": 0}
         self._stats_file: Path | None = None
+        self._stats_lines = 0  # stats.jsonl 当前行数（用于轮转判断）
 
         # 兼容旧版 AstrBot：无 config 注入时退化为空配置
         if self.config is None:
@@ -158,6 +177,9 @@ class IntentionTrigger(Star):
         self._sem = asyncio.Semaphore(self.cfg("max_concurrency", 8))
         try:
             self._stats_file = StarTools.get_data_dir(PLUGIN_NAME) / "stats.jsonl"
+            if self._stats_file.exists():
+                with open(self._stats_file, encoding="utf-8") as f:
+                    self._stats_lines = sum(1 for _ in f)
         except Exception:
             self._stats_file = None
 
@@ -308,30 +330,45 @@ class IntentionTrigger(Star):
                 )
         raise RuntimeError("TypeSafe API 调用重试耗尽")
 
-    async def _judge_single(self, state: dict) -> float:
-        """单条消息判定，返回 noul 概率。"""
+    async def _judge_single(self, state: dict) -> tuple[float, str | None, dict]:
+        """单条消息判定，返回 (noul 概率, 意图分类, usage)。"""
         instructions = self.cfg("custom_instructions", "") or DEFAULT_INSTRUCTIONS
+        questions = {
+            "wants_interaction": {
+                "type": "noul",
+                "instructions": instructions,
+                "criteria": DEFAULT_CRITERIA,
+            }
+        }
+        if self.cfg("enable_category_hint", True):
+            questions["intent_category"] = {
+                "type": "choice",
+                "instructions": "Classify the speaker's intent toward the bot.",
+                "criteria": CATEGORY_CRITERIA,
+            }
         payload = {
             "state": state,
             "model": self.cfg("model", "jev-latest"),
-            "questions": {
-                "wants_interaction": {
-                    "type": "noul",
-                    "instructions": instructions,
-                    "criteria": DEFAULT_CRITERIA,
-                }
-            },
+            "questions": questions,
         }
         data = await self._post_systemone(payload)
-        answer = (data.get("answers") or {}).get("wants_interaction") or {}
+        answers = data.get("answers") or {}
+        answer = answers.get("wants_interaction") or {}
         value = answer.get("noul")
         if not isinstance(value, (int, float)):
             raise ValueError(f"Jev 响应缺少 noul 字段: {json.dumps(data)[:200]}")
-        return float(value)
+        category = (answers.get("intent_category") or {}).get("choice")
+        return float(value), category, self._usage_of(data)
 
-    async def _judge_pool(self, state: dict, count: int) -> list[float]:
-        """池内每条消息一个 noul 问题，一次调用并行判定，返回按序概率列表。"""
+    async def _judge_pool(
+        self, state: dict, count: int
+    ) -> tuple[list[float], list[str | None], dict]:
+        """池内每条消息一个 noul + choice 问题，一次调用并行判定。
+
+        返回 (按序 noul 概率列表, 按序意图分类列表, usage)。
+        """
         instructions_tpl = self.cfg("custom_instructions", "") or DEFAULT_INSTRUCTIONS
+        want_category = self.cfg("enable_category_hint", True)
         questions = {}
         for i in range(count):
             questions[f"msg_{i}"] = {
@@ -345,6 +382,15 @@ class IntentionTrigger(Star):
                 ),
                 "criteria": DEFAULT_CRITERIA,
             }
+            if want_category:
+                questions[f"cat_{i}"] = {
+                    "type": "choice",
+                    "instructions": (
+                        f"Classify the speaker's intent of `messages[{i}]` "
+                        "toward the bot."
+                    ),
+                    "criteria": CATEGORY_CRITERIA,
+                }
         payload = {
             "state": state,
             "model": self.cfg("model", "jev-latest"),
@@ -352,7 +398,8 @@ class IntentionTrigger(Star):
         }
         data = await self._post_systemone(payload)
         answers = data.get("answers") or {}
-        scores = []
+        scores: list[float] = []
+        categories: list[str | None] = []
         for i in range(count):
             value = (answers.get(f"msg_{i}") or {}).get("noul")
             if not isinstance(value, (int, float)):
@@ -360,7 +407,16 @@ class IntentionTrigger(Star):
                     f"Jev 响应缺少 msg_{i}.noul 字段: {json.dumps(data)[:200]}"
                 )
             scores.append(float(value))
-        return scores
+            categories.append((answers.get(f"cat_{i}") or {}).get("choice"))
+        return scores, categories, self._usage_of(data)
+
+    @staticmethod
+    def _usage_of(data: dict) -> dict:
+        usage = data.get("usage") or {}
+        return {
+            "input_tokens": int(usage.get("input_tokens") or 0),
+            "output_tokens": int(usage.get("output_tokens") or 0),
+        }
 
     # ------------------------------------------------------------------ #
     # 消息池
@@ -408,12 +464,41 @@ class IntentionTrigger(Star):
                     self._spawn_flush(group_id, entries)
         except asyncio.CancelledError:
             pass
+        except Exception as e:
+            # 兜底：定时器崩溃时唤醒池内所有消息，避免 future 悬挂到 wait_for 超时
+            logger.error(f"[intentiontrigger] 消息池定时器异常: {e}")
+            await self._drain_pool_quietly(group_id)
+
+    async def _drain_pool_quietly(self, group_id: str):
+        """异常兜底：清空该群的消息池并把所有 future 置为 None（按错误路径处理）。"""
+        try:
+            async with self._lock_for(group_id):
+                self._timers.pop(group_id, None)
+                pool = self._pools.get(group_id) or []
+                self._pools[group_id] = []
+        except Exception as drain_err:
+            logger.error(f"[intentiontrigger] 清空消息池失败: {drain_err}")
+            return
+        for entry in pool:
+            if entry.future and not entry.future.done():
+                entry.future.set_result(None)
 
     def _spawn_flush(self, group_id: str, entries: list[_PoolEntry]):
         """在后台执行批量判定（不阻塞入池协程）。"""
-        task = asyncio.create_task(self._flush_pool(group_id, entries))
+        task = asyncio.create_task(self._flush_pool_safe(group_id, entries))
         self._flush_tasks.add(task)
         task.add_done_callback(self._flush_tasks.discard)
+
+    async def _flush_pool_safe(self, group_id: str, entries: list[_PoolEntry]):
+        """_flush_pool 的异常兜底外壳，保证任何情况下 future 都被 resolve。"""
+        try:
+            await self._flush_pool(group_id, entries)
+        except Exception as e:
+            self.stats["errors"] += 1
+            logger.error(f"[intentiontrigger] 消息池判定流程异常: {e}")
+            for entry in entries:
+                if entry.future and not entry.future.done():
+                    entry.future.set_result(None)
 
     async def _flush_pool(self, group_id: str, entries: list[_PoolEntry]):
         threshold = float(self.cfg("threshold", 0.5))
@@ -432,7 +517,7 @@ class IntentionTrigger(Star):
         }
         t0 = time.monotonic()
         try:
-            scores = await self._judge_pool(state, len(entries))
+            scores, categories, usage = await self._judge_pool(state, len(entries))
         except Exception as e:
             self.stats["errors"] += 1
             logger.warning(f"[intentiontrigger] Jev 池判定失败: {e}")
@@ -453,8 +538,8 @@ class IntentionTrigger(Star):
             )
             pass_through = self.cfg("on_error", "suppress") == "pass_to_llm"
             for entry in entries:
-                if not entry.future.done():
-                    entry.future.set_result((-1.0, pass_through))
+                if entry.future and not entry.future.done():
+                    entry.future.set_result((-1.0, pass_through, None))
             return
 
         latency_ms = (time.monotonic() - t0) * 1000
@@ -466,22 +551,27 @@ class IntentionTrigger(Star):
                 mode="pool",
                 latency_ms=latency_ms,
                 model=self.cfg("model", "jev-latest"),
-                usage={},
+                usage=usage,
                 messages=[
                     {
                         "text": e.text,
                         "sender": e.sender_name,
                         "noul": round(s, 4),
                         "triggered": trig,
+                        "category": cat,
                     }
-                    for e, s, trig in zip(entries, scores, triggered_flags)
+                    for e, s, trig, cat in zip(
+                        entries, scores, triggered_flags, categories
+                    )
                 ],
                 error=None,
             )
         )
-        for entry, score, trig in zip(entries, scores, triggered_flags):
-            if not entry.future.done():
-                entry.future.set_result((score, trig))
+        for entry, score, trig, cat in zip(
+            entries, scores, triggered_flags, categories
+        ):
+            if entry.future and not entry.future.done():
+                entry.future.set_result((score, trig, cat))
 
     def _decide_triggers(self, scores: list[float], threshold: float) -> list[bool]:
         """把分数转为放行标记；one_reply_per_flush 时同池只放行最高分。"""
@@ -522,7 +612,7 @@ class IntentionTrigger(Star):
             }
             t0 = time.monotonic()
             try:
-                score = await self._judge_single(state)
+                score, category, usage = await self._judge_single(state)
             except Exception as e:
                 self.stats["errors"] += 1
                 logger.warning(f"[intentiontrigger] Jev 调用失败: {e}")
@@ -556,13 +646,14 @@ class IntentionTrigger(Star):
                     mode="single",
                     latency_ms=(time.monotonic() - t0) * 1000,
                     model=self.cfg("model", "jev-latest"),
-                    usage={},
+                    usage=usage,
                     messages=[
                         {
                             "text": text,
                             "sender": event.get_sender_name(),
                             "noul": round(score, 4),
                             "triggered": trig,
+                            "category": category,
                         }
                     ],
                     error=None,
@@ -582,7 +673,7 @@ class IntentionTrigger(Star):
                 if self.cfg("on_error", "suppress") == "pass_to_llm":
                     event.is_at_or_wake_command = True
                 return
-            score, trig = result
+            score, trig, category = result
             if score < 0:  # API 错误（on_error 已在 flush 端处理 pass_through 语义）
                 if trig:
                     event.is_at_or_wake_command = True
@@ -592,11 +683,15 @@ class IntentionTrigger(Star):
             self.stats["triggered"] += 1
             # 关键一步：让 ProcessStage 把这条消息当作被唤醒的消息交给主 LLM
             event.is_at_or_wake_command = True
+            # 意图分类供 on_llm_request 钩子追加风格提示
+            if category and category in CATEGORY_CRITERIA and category != "not_addressed":
+                event.set_extra("intention_category", category)
             if self.cfg("log_decisions", False):
                 logger.info(
-                    "[intentiontrigger] ✅ 触发 (score=%.3f>=%.3f): %r",
+                    "[intentiontrigger] ✅ 触发 (score=%.3f>=%.3f, cat=%s): %r",
                     score,
                     threshold,
+                    category,
                     event.message_str,
                 )
         else:
@@ -612,30 +707,77 @@ class IntentionTrigger(Star):
                 # 可选：连同其他插件对普通群消息的监听一起拦截（默认关闭）
                 event.stop_event()
 
+    @filter.on_llm_request()
+    async def inject_category_hint(self, event: AstrMessageEvent, req) -> None:
+        """把意图分类的风格提示追加到主 LLM 输入末尾（不动 system prompt，避免破坏前缀缓存）。"""
+        if not self.cfg("enable_category_hint", True):
+            return
+        category = event.get_extra("intention_category")
+        if not category:
+            return
+        hints = self.cfg("category_hints", {}) or DEFAULT_CATEGORY_HINTS
+        hint = (hints.get(category) if isinstance(hints, dict) else None) or (
+            DEFAULT_CATEGORY_HINTS.get(category)
+        )
+        if not hint:
+            return
+        suffix = f"\n{hint}"
+        if req.prompt:
+            if hint in req.prompt:
+                return  # 避免重试/重入时重复追加
+            req.prompt = f"{req.prompt}{suffix}"
+        else:
+            req.prompt = hint
+
     # ------------------------------------------------------------------ #
     # 统计记录与 WebUI 接口
     # ------------------------------------------------------------------ #
 
     def _record(self, record: _CallRecord):
-        """统计入内存环形缓冲并追加落盘（落盘失败静默忽略）。"""
+        """统计入内存环形缓冲并追加落盘（按行数轮转，落盘失败静默忽略）。"""
         self.recent_calls.append(record)
         if self._stats_file is None:
             return
         try:
+            max_lines = int(self.cfg("stats_max_lines", 5000))
+            if max_lines > 0 and self._stats_lines + 1 > max_lines:
+                self._rotate_stats_file(keep=max_lines // 2)
+            self._stats_lines += 1
             with open(self._stats_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record.to_dict(), ensure_ascii=False) + "\n")
         except Exception as e:
             logger.debug(f"[intentiontrigger] 统计落盘失败: {e}")
 
+    def _rotate_stats_file(self, keep: int):
+        """保留 stats.jsonl 的最后 keep 行，防止长跑膨胀。"""
+        try:
+            with open(self._stats_file, encoding="utf-8") as f:
+                lines = f.readlines()
+            if len(lines) > keep:
+                with open(self._stats_file, "w", encoding="utf-8") as f:
+                    f.writelines(lines[-keep:])
+                self._stats_lines = keep
+                logger.info(
+                    "[intentiontrigger] stats.jsonl 已轮转，保留最近 %d 条。", keep
+                )
+        except Exception as e:
+            logger.debug(f"[intentiontrigger] stats.jsonl 轮转失败: {e}")
+
     def _overview(self) -> dict:
         total_msgs = triggered = errored = 0
-        latencies = []
+        latencies = []  # 仅成功调用，避免超时/错误污染健康度
         scores = []
+        input_tokens = output_tokens = 0
+        categories: dict[str, int] = {}
         by_group: dict[str, dict] = {}
         for rec in self.recent_calls:
             if rec.error:
                 errored += 1
-            latencies.append(rec.latency_ms)
+            else:
+                latencies.append(rec.latency_ms)
+            usage = rec.usage or {}
+            input_tokens += int(usage.get("input_tokens") or 0)
+            output_tokens += int(usage.get("output_tokens") or 0)
             g = by_group.setdefault(
                 rec.group_id or "未知",
                 {"calls": 0, "messages": 0, "triggered": 0},
@@ -646,12 +788,18 @@ class IntentionTrigger(Star):
                 g["messages"] += 1
                 if m.get("noul") is not None:
                     scores.append(m["noul"])
+                cat = m.get("category")
+                if cat:
+                    categories[cat] = categories.get(cat, 0) + 1
                 if m.get("triggered"):
                     triggered += 1
                     g["triggered"] += 1
         bins = [0] * 10
         for s in scores:
             bins[min(int(s * 10), 9)] += 1
+        price_in = float(self.cfg("price_per_mtok_input", 0.042))
+        price_out = float(self.cfg("price_per_mtok_output", 0.0))
+        est_cost = input_tokens / 1e6 * price_in + output_tokens / 1e6 * price_out
         return {
             "config": {
                 "mode": self.cfg("mode", "pool"),
@@ -679,6 +827,16 @@ class IntentionTrigger(Star):
                 "bins": [f"{i / 10:.1f}-{(i + 1) / 10:.1f}" for i in range(10)],
                 "counts": bins,
             },
+            "costs": {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "est_cost_usd": round(est_cost, 6),
+                "price_per_mtok_input": price_in,
+                "price_per_mtok_output": price_out,
+                "note": "估算仅覆盖最近 %d 次调用（内存缓冲），历史数据见 stats.jsonl"
+                % RECENT_CALLS_MAX,
+            },
+            "categories": categories,
             "by_group": [
                 {"group_id": k, **v}
                 for k, v in sorted(by_group.items(), key=lambda kv: -kv[1]["messages"])
@@ -704,38 +862,44 @@ class IntentionTrigger(Star):
         return json_response({"status": "ok", "data": items})
 
     async def _api_test(self):
-        body = await request.json(default={})
-        text = str(body.get("text", "")).strip()
-        if not text:
+        # 注：dashboard 自研 HTTP 层下 request.json(default=...) 会静默失败，
+        # 这里直接读原始 body 自行解析
+        try:
+            raw = await request.body()
+            body = json.loads(raw) if raw else {}
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        raw = str(body.get("text", "")).strip()
+        if not raw:
             return error_response("缺少 text 字段")
         if not self.api_key:
             return error_response("未配置 TypeSafe API Key")
-        state = {
-            "bot": self._bot_desc(),
-            "chat": {"type": "group", "speaker_name": "tester", "speaker_id": "0"},
-            "message": text,
-        }
+        threshold = float(self.cfg("threshold", 0.5))
         t0 = time.monotonic()
         try:
-            score = await self._judge_single(state)
+            messages, usage = await self._judge_test_text(raw)
         except Exception as e:
             return error_response(f"调用失败: {e}")
-        threshold = float(self.cfg("threshold", 0.5))
+        latency_ms = (time.monotonic() - t0) * 1000
         self._record(
             _CallRecord(
                 ts=time.time(),
                 group_id="(手动测试)",
-                mode="single",
-                latency_ms=(time.monotonic() - t0) * 1000,
+                mode="multi" if len(messages) > 1 else "single",
+                latency_ms=latency_ms,
                 model=self.cfg("model", "jev-latest"),
-                usage={},
+                usage=usage,
                 messages=[
                     {
-                        "text": text,
+                        "text": m["text"],
                         "sender": "tester",
-                        "noul": round(score, 4),
-                        "triggered": score >= threshold,
+                        "noul": round(m["noul"], 4),
+                        "triggered": m["noul"] >= threshold,
+                        "category": m.get("category"),
                     }
+                    for m in messages
                 ],
                 error=None,
             )
@@ -744,13 +908,51 @@ class IntentionTrigger(Star):
             {
                 "status": "ok",
                 "data": {
-                    "noul": round(score, 4),
                     "threshold": threshold,
-                    "triggered": score >= threshold,
-                    "latency_ms": round((time.monotonic() - t0) * 1000, 1),
+                    "latency_ms": round(latency_ms, 1),
+                    "mode": "multi" if len(messages) > 1 else "single",
+                    "messages": [
+                        {
+                            "text": m["text"],
+                            "noul": round(m["noul"], 4),
+                            "triggered": m["noul"] >= threshold,
+                            "category": m.get("category"),
+                        }
+                        for m in messages
+                    ],
                 },
             }
         )
+
+    async def _judge_test_text(self, raw: str) -> tuple[list[dict], dict]:
+        """手动测试判定：多行文本按「一行一条消息的群聊上下文」走池判定，
+        与生产 pool 模式一致；单行走 single 判定。"""
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        if len(lines) > 1:
+            state = {
+                "bot": self._bot_desc(),
+                "chat": {"type": "group", "group_id": "(手动测试)"},
+                "messages": [
+                    {"index": i, "sender_name": f"speaker{i + 1}", "sender_id": str(i),
+                     "text": t}
+                    for i, t in enumerate(lines)
+                ],
+            }
+            scores, categories, usage = await self._judge_pool(state, len(lines))
+            return (
+                [
+                    {"text": t, "noul": s, "category": c}
+                    for t, s, c in zip(lines, scores, categories)
+                ],
+                usage,
+            )
+        state = {
+            "bot": self._bot_desc(),
+            "chat": {"type": "group", "speaker_name": "tester", "speaker_id": "0"},
+            "message": lines[0],
+        }
+        score, category, usage = await self._judge_single(state)
+        return ([{"text": lines[0], "noul": score, "category": category}], usage)
 
     # ------------------------------------------------------------------ #
     # 管理指令：/intention status|test|on|off
@@ -775,34 +977,47 @@ class IntentionTrigger(Star):
 
         elif sub == "test":
             if not rest:
-                yield event.plain_result("用法: /intention test <要测试的群消息文本>")
+                yield event.plain_result(
+                    "用法: /intention test <文本>\n"
+                    "多行文本（换行分隔）会按群聊上下文走池判定，每行各出分数，"
+                    "与生产模式一致。"
+                )
                 return
             if not self.api_key:
                 yield event.plain_result("尚未配置 TypeSafe API Key，无法测试。")
                 return
-            state = {
-                "bot": self._bot_desc(event.get_self_id()),
-                "chat": {
-                    "type": "group",
-                    "speaker_name": "tester",
-                    "speaker_id": "0",
-                },
-                "message": rest,
-            }
             try:
-                score = await self._judge_single(state)
+                messages, usage = await self._judge_test_text(rest)
             except Exception as e:
                 yield event.plain_result(f"调用失败: {e}")
                 return
             threshold = float(self.cfg("threshold", 0.5))
-            verdict = "✅ 会触发主 LLM" if score >= threshold else "⛔ 不会触发"
+            cat_names = {
+                "question": "提问",
+                "chitchat": "闲聊",
+                "command": "指令",
+                "meme": "玩梗",
+                "not_addressed": "非对bot",
+            }
+            lines = []
+            for i, m in enumerate(messages, 1):
+                verdict = "✅触发" if m["noul"] >= threshold else "⛔抑制"
+                cat = cat_names.get(m.get("category") or "", "")
+                lines.append(
+                    f"{i}. {verdict} noul={m['noul']:.3f}"
+                    + (f" [{cat}]" if cat else "")
+                    + f" {m['text'][:40]}"
+                )
             yield event.plain_result(
-                f"noul={score:.3f}（阈值 {threshold}）\n判定: {verdict}"
+                f"阈值 {threshold}，"
+                f"tokens: in={usage.get('input_tokens', 0)}/out={usage.get('output_tokens', 0)}\n"
+                + "\n".join(lines)
             )
 
         else:  # status
             ov = self._overview()
             c, t = ov["config"], ov["totals"]
+            cost = ov["costs"]
             lines = [
                 f"启用: {self.cfg('enable', True)}  模式: {c['mode']}"
                 + (
@@ -821,6 +1036,8 @@ class IntentionTrigger(Star):
                     if t["avg_latency_ms"] is not None
                     else ""
                 ),
+                f"花费(近期): in={cost['input_tokens']} tok / out={cost['output_tokens']} tok"
+                f" ≈ ${cost['est_cost_usd']:.4f}",
                 "详细统计页: WebUI → 插件 → astrbot_plugin_intentiontrigger → 统计页",
             ]
             yield event.plain_result("\n".join(lines))

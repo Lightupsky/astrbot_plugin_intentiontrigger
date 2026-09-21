@@ -90,6 +90,57 @@
     "options": ["suppress", "pass_to_llm"],
     "hint": "suppress：当作无意图处理（机器人保持安静，仅 @ 可唤醒）；pass_to_llm：放行给主 LLM（API 故障期间机器人会变得话多且花费增加）"
   },
+  "enable_category_hint": {
+    "description": "启用意图分类风格提示",
+    "type": "bool",
+    "default": true,
+    "hint": "判定时附带 choice 问题，将发言分类为 提问/闲聊/指令/玩梗；放行的消息会把对应风格提示追加到主 LLM 输入末尾（不动 system prompt）。会增加少量输入 token"
+  },
+  "category_hints": {
+    "description": "分类风格提示文案",
+    "type": "object",
+    "hint": "放行的消息会把对应类别的提示追加到主 LLM 输入末尾；留空则使用内置默认文案",
+    "items": {
+      "question": {
+        "description": "提问类的提示",
+        "type": "string",
+        "default": "[意图提示] 用户这条消息是在向你提问/求助，请直接、清晰地解答。"
+      },
+      "chitchat": {
+        "description": "闲聊类的提示",
+        "type": "string",
+        "default": "[意图提示] 用户在和你闲聊寒暄，回复轻松简短即可，不必长篇大论。"
+      },
+      "command": {
+        "description": "指令类的提示",
+        "type": "string",
+        "default": "[意图提示] 用户在对你下达指令/任务，请执行并把结果汇报给用户。"
+      },
+      "meme": {
+        "description": "玩梗类的提示",
+        "type": "string",
+        "default": "[意图提示] 用户在玩梗/逗弄你，可以放松、幽默地接梗。"
+      }
+    }
+  },
+  "price_per_mtok_input": {
+    "description": "输入单价（美元/百万 token）",
+    "type": "float",
+    "default": 0.042,
+    "hint": "用于统计页的花费估算。默认为 Jev 1.13 官方定价 $0.042/Mtok（输出免费），调价后可修改"
+  },
+  "price_per_mtok_output": {
+    "description": "输出单价（美元/百万 token）",
+    "type": "float",
+    "default": 0.0,
+    "hint": "Jev 目前输出 token 免费，保持 0 即可"
+  },
+  "stats_max_lines": {
+    "description": "统计落盘最大行数",
+    "type": "int",
+    "default": 5000,
+    "hint": "stats.jsonl 超过该行数时自动轮转，保留最近一半；设为 0 关闭轮转"
+  },
   "custom_instructions": {
     "description": "自定义判定指令（高级）",
     "type": "text",
