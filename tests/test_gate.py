@@ -94,6 +94,8 @@ async def fake_systemone(request: web.Request) -> web.Response:
     body = await request.json()
     assert request.headers["Authorization"].startswith("Bearer ")
     CALLS["n"] += 1
+    # bot 能力信息必须存在（祈使句能力判别的依据）
+    assert body["state"]["bot"]["capabilities"], "state.bot.capabilities 缺失"
     answers = {}
     for key, q in body["questions"].items():
         if q["type"] == "noul":
@@ -293,6 +295,13 @@ async def main() -> int:
     check("overview: bot_names 正确", ov["config"]["bot_names"] == ["鸭嘴兽"])
     check("overview: 含花费估算与分类分布",
           "costs" in ov and "categories" in ov and ov["costs"]["est_cost_usd"] > 0)
+    check("bot_desc: 含兜底能力描述",
+          "capabilities" in p8._bot_desc() and p8._bot_desc()["capabilities"])
+    p_cap = make_plugin({"bot_capabilities": ["聊天问答", "查询快递"]})
+    await p_cap.initialize()
+    check("bot_desc: 自定义能力生效",
+          p_cap._bot_desc()["capabilities"] == ["聊天问答", "查询快递"])
+    await p_cap.terminate()
 
     # ---------------- 平均延迟排除错误记录 ----------------
     err_rec = plugin_module._CallRecord(

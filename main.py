@@ -43,28 +43,49 @@ PLUGIN_NAME = "astrbot_plugin_intentiontrigger"
 RECENT_CALLS_MAX = 300  # 内存环形缓冲条数
 
 DEFAULT_INSTRUCTIONS = (
-    "The `state` describes a group chat and an assistant bot (`bot`) present in it. "
-    "Judge whether the referenced message is the speaker intending to interact "
-    "with that bot: addressing it, calling it by name or alias, greeting it, "
-    "asking or telling it something, giving it a command, or otherwise expecting "
-    "the bot to reply.\n"
+    "The `state` is a group chat; `bot` is an assistant bot present in it, and "
+    "`bot.capabilities` describes what the bot can actually do. Judge whether "
+    "the speaker of the referenced message expects THE BOT to reply or act.\n"
+    "Judge YES when: the message explicitly addresses the bot (name, alias, "
+    "greeting, or reply); OR it continues a conversation the speaker was "
+    "already having with the bot (short follow-ups like `在吗`, `快理我`, "
+    "`换一个`); OR it is a bare request whose requested action clearly falls "
+    "within `bot.capabilities` and expects a response.\n"
+    "Judge NO when: it is human-to-human chat or self-talk; OR it is a wish or "
+    "bare imperative with NO addressee marker whose requested action is far "
+    "beyond `bot.capabilities` (e.g. playing a video game, adding a feature to "
+    "another product, physical-world actions) - the speaker cannot be "
+    "expecting the bot to do that, so it is self-talk or aimed at other "
+    "humans; OR the bot's name appears only as a topic between humans; OR it "
+    "is a rhetorical question not aimed at the bot.\n"
     "The message may be in any language (Chinese, English, Japanese, ...). "
-    "Judge the speaker's intent, not keyword matches alone: mentions of the "
-    "bot's name between humans, rhetorical questions and human-to-human chat "
-    "do not count; questions, requests or summons aimed at the bot do count."
+    "Judge the speaker's intent, not keyword matches alone.\n"
+    "When signals conflict, explicit address always wins: if the speaker "
+    "addresses the bot by name or alias, judge YES even when the request is "
+    "beyond the bot's capabilities."
 )
 
 DEFAULT_CRITERIA = {
     "true": (
-        "The utterance is directed at the bot: it greets, asks, tells or "
-        "commands the bot, addresses it by name/alias, replies to it, or "
-        "clearly expects a response from the bot."
+        "The speaker expects the bot itself to respond or act: the bot is "
+        "explicitly addressed, the message continues a bot-directed "
+        "conversation, or the requested action is within the bot's "
+        "capabilities and clearly expects a bot response."
     ),
     "false": (
-        "The utterance is human-to-human conversation, self-talk, or content "
-        "not aimed at the bot at all."
+        "Human-to-human chat, self-talk, or wishes/commands with no addressee "
+        "whose action is beyond the bot's capabilities, or content not aimed "
+        "at the bot at all."
     ),
 }
+
+# bot_capabilities 未配置时的兜底能力描述（通用聊天助手）
+GENERIC_CAPABILITIES = [
+    "chatting with group members and answering questions",
+    "looking up or retrieving general information",
+    "text tasks such as translation, summarization, and writing",
+    "telling jokes and casual conversation",
+]
 
 # 意图分类（choice 问题）的选项与判定标准
 CATEGORY_CRITERIA = {
@@ -143,7 +164,7 @@ class _CallRecord:
     "astrbot_plugin_intentiontrigger",
     "Lightupsky",
     "利用 Jev 模型识别群聊互动意图，仅在有人想和机器人互动时才唤起主 LLM",
-    "1.2.0",
+    "1.3.0",
 )
 class IntentionTrigger(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -264,6 +285,10 @@ class IntentionTrigger(Star):
         if not names:
             names = ["the bot"]
         desc = {"name": names[0], "aliases": names}
+        capabilities = [
+            str(c).strip() for c in (self.cfg("bot_capabilities", []) or []) if str(c).strip()
+        ]
+        desc["capabilities"] = capabilities or GENERIC_CAPABILITIES
         if self_id:
             desc["bot_self_id"] = str(self_id)
         return desc
