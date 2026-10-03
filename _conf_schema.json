@@ -78,6 +78,48 @@
     "default": [],
     "hint": "优先级高于白名单，这些群不做意图门控"
   },
+  "min_text_length": {
+    "description": "过短消息忽略（字符数）",
+    "type": "int",
+    "default": 3,
+    "hint": "短于该字符数的消息不进 Jev 判定、直接忽略（如 \"6\"\"哈哈\"）。注意默认 3 会忽略\"在吗\"这类 2 字消息，可调回 2 或 0（关闭）。被 @ 不受影响"
+  },
+  "trigger_probability": {
+    "description": "唤醒概率（0~1）",
+    "type": "float",
+    "default": 1.0,
+    "hint": "Jev 判过阈值后再掷随机数，命中才交给主 LLM，否则静默。1.0=不启用；缓解\"过度热情\"建议 0.6~0.8。正则强制触发不受此限制"
+  },
+  "group_cooldown_seconds": {
+    "description": "群冷却（秒）",
+    "type": "int",
+    "default": 0,
+    "hint": "本插件唤醒后 N 秒内该群再次判中会被静默，硬性限制主动回复频率。0=不启用；建议 30~120。被 @ 和正则强制触发不受限"
+  },
+  "force_trigger_regex": {
+    "description": "正则强制触发",
+    "type": "string",
+    "default": "",
+    "hint": "消息命中该正则时跳过 Jev 直接交给主 LLM（也不受概率/冷却限制），零 API 成本。如 \"鸭嘴兽|小鸭\"。留空禁用"
+  },
+  "force_suppress_regex": {
+    "description": "正则强制抑制",
+    "type": "string",
+    "default": "",
+    "hint": "消息命中该正则时本插件完全不介入（必静默），优先级最高。如 \"^(6|草|哈哈+|??+)$\"。留空禁用"
+  },
+  "react_on_trigger": {
+    "description": "触发时贴表情回应",
+    "type": "bool",
+    "default": false,
+    "hint": "最终放行给主 LLM 的消息会被贴上表情，让群友知道 bot 将要回应（概率/冷却抑制的不贴）。仅支持 aiocqhttp 平台（NapCat/LLOneBot 等需实现 set_msg_emoji_like）"
+  },
+  "react_emoji": {
+    "description": "贴表情的 emoji 代码",
+    "type": "string",
+    "default": "128077",
+    "hint": "128077=👍（Unicode 码点十进制），也可用 QQ 经典表情 ID（如 4=得意、66=流泪）。以你的协议端实现为准"
+  },
   "timeout_seconds": {
     "description": "API 调用超时（秒）",
     "type": "int",

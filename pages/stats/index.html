@@ -110,6 +110,12 @@
   </div>
 
   <div class="panel">
+    <h2>唤醒控制</h2>
+    <div class="cards" id="gate-cards" style="margin-bottom:6px"></div>
+    <div class="sub" style="margin:0" id="gate-note"></div>
+  </div>
+
+  <div class="panel">
     <h2>按群统计</h2>
     <table><thead><tr><th>群号</th><th>调用次数</th><th>消息数</th><th>触发</th><th>触发率</th></tr></thead>
     <tbody id="group-body"></tbody></table>
@@ -212,6 +218,29 @@ function renderOverview(d) {
       <div class="lbl">${b.replace("-0.", "-.")}</div></div>`;
   }).join("");
 
+  // 唤醒控制计数
+  const gs = d.since_restart || {};
+  const gateCards = [
+    ["过短忽略", gs.short_ignored ?? 0],
+    ["概率抑制", gs.probability_suppressed ?? 0],
+    ["冷却抑制", gs.cooldown_suppressed ?? 0],
+    ["正则强制", gs.force_triggered ?? 0],
+  ];
+  document.getElementById("gate-cards").innerHTML = gateCards
+    .map(([k, v]) => `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`)
+    .join("");
+  const settings = d.gate_settings || {};
+  const settingParts = [
+    `过短忽略 < ${settings.min_text_length ?? "-"} 字`,
+    settings.trigger_probability != null && settings.trigger_probability < 1 ? `唤醒概率 ${settings.trigger_probability}` : null,
+    settings.group_cooldown_seconds > 0 ? `冷却 ${settings.group_cooldown_seconds}s` : null,
+    settings.react_on_trigger ? `贴表情 ${settings.react_emoji ?? ""}` : null,
+    settings.force_trigger_regex ? `强制: ${settings.force_trigger_regex}` : null,
+    settings.force_suppress_regex ? `抑制: ${settings.force_suppress_regex}` : null,
+  ].filter(Boolean);
+  document.getElementById("gate-note").textContent =
+    settingParts.length ? "当前生效: " + settingParts.join(" · ") : "未启用额外唤醒控制";
+
   // 按群
   const gb = document.getElementById("group-body");
   if (!d.by_group.length) {
@@ -240,10 +269,13 @@ function renderCalls(items) {
       const sc = m.noul == null ? '<span class="err">错误</span>'
         : `<span class="score${m.triggered ? " trig" : ""}">${m.noul.toFixed(3)}</span>`;
       const flag = m.triggered ? '<span class="chip ok">✅ 放行</span>' : '<span class="chip">⛔ 抑制</span>';
+      const noteChip = m.note === "probability" ? ' <span class="chip cat">🎲 概率</span>'
+        : m.note === "cooldown" ? ' <span class="chip cat">❄️ 冷却</span>'
+        : m.force ? ' <span class="chip cat">⚡ 正则</span>' : "";
       const cat = m.category && CAT_NAMES[m.category]
         ? ` <span class="chip cat">${CAT_NAMES[m.category]}</span>` : "";
       return `<div class="msg-row"><span class="who">${esc(m.sender)}</span>
-        <span class="txt">${esc(m.text)}</span><span>${sc}</span><span>${flag}${cat}</span></div>`;
+        <span class="txt">${esc(m.text)}</span><span>${sc}</span><span>${flag}${noteChip}${cat}</span></div>`;
     }).join("");
     const errTag = r.error ? ` <span class="err">错误: ${esc(r.error).slice(0, 80)}</span>` : "";
     const modeName = r.mode === "pool" ? "池判定" : r.mode === "multi" ? "多行测试" : "单条";

@@ -23,6 +23,8 @@
 
 import asyncio
 import json
+import random
+import re
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -164,7 +166,7 @@ class _CallRecord:
     "astrbot_plugin_intentiontrigger",
     "Lightupsky",
     "利用 Jev 模型识别群聊互动意图，仅在有人想和机器人互动时才唤起主 LLM",
-    "1.3.0",
+    "1.4.0",
 )
 class IntentionTrigger(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -181,9 +183,22 @@ class IntentionTrigger(Star):
         self._pool_locks: dict[str, asyncio.Lock] = {}
         self._timers: dict[str, asyncio.Task] = {}
         self._flush_tasks: set[asyncio.Task] = set()
+        self._react_tasks: set[asyncio.Task] = set()
+        # 群冷却：上次由本插件唤醒的时间戳
+        self._last_wake: dict[str, float] = {}
+        self._regex_cache: dict[str, re.Pattern | None] = {}
         # 统计
         self.recent_calls: deque[_CallRecord] = deque(maxlen=RECENT_CALLS_MAX)
-        self.stats = {"checked": 0, "triggered": 0, "suppressed": 0, "errors": 0}
+        self.stats = {
+            "checked": 0,
+            "triggered": 0,
+            "suppressed": 0,
+            "errors": 0,
+            "short_ignored": 0,
+            "probability_suppressed": 0,
+            "cooldown_suppressed": 0,
+            "force_triggered": 0,
+        }
         self._stats_file: Path | None = None
         self._stats_lines = 0  # stats.jsonl 当前行数（用于轮转判断）
 
@@ -255,6 +270,9 @@ class IntentionTrigger(Star):
         for task in self._flush_tasks:
             task.cancel()
         self._flush_tasks.clear()
+        for task in self._react_tasks:
+            task.cancel()
+        self._react_tasks.clear()
         if self._session and not self._session.closed:
             await self._session.close()
         self._session = None
@@ -324,7 +342,70 @@ class IntentionTrigger(Star):
         if group_id not in whitelist:
             return False
         blacklist = [str(g).strip() for g in (self.cfg("group_blacklist", []) or [])]
-        return group_id not in blacklist
+        if group_id in blacklist:
+            return False
+        text = (event.message_str or "").strip()
+        # 正则强制抑制：命中则本插件完全不介入
+        if self._match_regex(self.cfg("force_suppress_regex", ""), text):
+            return False
+        # 过短消息直接忽略（不进 Jev 判定）
+        min_len = int(self.cfg("min_text_length", 3) or 0)
+        if min_len > 0 and len(text) < min_len:
+            self.stats["short_ignored"] += 1
+            return False
+        return True
+
+    def _match_regex(self, pattern: str, text: str) -> bool:
+        """按缓存编译正则并匹配；非法表达式警告一次后视为禁用。"""
+        pattern = (pattern or "").strip()
+        if not pattern:
+            return False
+        if pattern not in self._regex_cache:
+            try:
+                self._regex_cache[pattern] = re.compile(pattern)
+            except re.error as e:
+                logger.warning(f"[intentiontrigger] 正则无效（已忽略）: {pattern!r} - {e}")
+                self._regex_cache[pattern] = None
+        compiled = self._regex_cache[pattern]
+        if compiled is None:
+            return False
+        try:
+            return bool(compiled.search(text))
+        except Exception:
+            return False
+
+    def _cooldown_active(self, group_id: str) -> bool:
+        """群冷却检查：本插件距上次唤醒是否仍在冷却期内。"""
+        cooldown = float(self.cfg("group_cooldown_seconds", 0) or 0)
+        if cooldown <= 0:
+            return False
+        last = self._last_wake.get(group_id)
+        return last is not None and (time.monotonic() - last) < cooldown
+
+    def _schedule_react(self, event: AstrMessageEvent):
+        """为最终放行的消息贴表情回应（异步，不阻塞管道）。"""
+        if not self.cfg("react_on_trigger", False):
+            return
+        task = asyncio.create_task(self._react_message(event))
+        self._react_tasks.add(task)
+        task.add_done_callback(self._react_tasks.discard)
+
+    async def _react_message(self, event: AstrMessageEvent):
+        try:
+            if event.get_platform_name() != "aiocqhttp":
+                return
+            client = getattr(event, "bot", None)
+            message_id = getattr(
+                getattr(event, "message_obj", None), "message_id", None
+            )
+            if client is None or not message_id:
+                return
+            emoji = str(self.cfg("react_emoji", "128077"))
+            await client.call_action(
+                "set_msg_emoji_like", message_id=str(message_id), emoji_code=emoji
+            )
+        except Exception as e:
+            logger.debug(f"[intentiontrigger] 贴表情失败: {e}")
 
     # ------------------------------------------------------------------ #
     # TypeSafe API 调用
@@ -564,39 +645,39 @@ class IntentionTrigger(Star):
             pass_through = self.cfg("on_error", "suppress") == "pass_to_llm"
             for entry in entries:
                 if entry.future and not entry.future.done():
-                    entry.future.set_result((-1.0, pass_through, None))
+                    entry.future.set_result((-1.0, pass_through, None, None))
             return
 
         latency_ms = (time.monotonic() - t0) * 1000
         triggered_flags = self._decide_triggers(scores, threshold)
-        self._record(
-            _CallRecord(
-                ts=time.time(),
-                group_id=group_id,
-                mode="pool",
-                latency_ms=latency_ms,
-                model=self.cfg("model", "jev-latest"),
-                usage=usage,
-                messages=[
-                    {
-                        "text": e.text,
-                        "sender": e.sender_name,
-                        "noul": round(s, 4),
-                        "triggered": trig,
-                        "category": cat,
-                    }
-                    for e, s, trig, cat in zip(
-                        entries, scores, triggered_flags, categories
-                    )
-                ],
-                error=None,
-            )
+        record = _CallRecord(
+            ts=time.time(),
+            group_id=group_id,
+            mode="pool",
+            latency_ms=latency_ms,
+            model=self.cfg("model", "jev-latest"),
+            usage=usage,
+            messages=[
+                {
+                    "text": e.text,
+                    "sender": e.sender_name,
+                    "noul": round(s, 4),
+                    "triggered": trig,
+                    "category": cat,
+                }
+                for e, s, trig, cat in zip(
+                    entries, scores, triggered_flags, categories
+                )
+            ],
+            error=None,
         )
-        for entry, score, trig, cat in zip(
-            entries, scores, triggered_flags, categories
+        self._record(record)
+        for i, (entry, score, trig, cat) in enumerate(
+            zip(entries, scores, triggered_flags, categories)
         ):
             if entry.future and not entry.future.done():
-                entry.future.set_result((score, trig, cat))
+                # 第 4 个元素是记录内消息 dict 的引用，供 handler 回写最终裁决
+                entry.future.set_result((score, trig, cat, record.messages[i]))
 
     def _decide_triggers(self, scores: list[float], threshold: float) -> list[bool]:
         """把分数转为放行标记；one_reply_per_flush 时同池只放行最高分。"""
@@ -622,6 +703,40 @@ class IntentionTrigger(Star):
         self.stats["checked"] += 1
         threshold = float(self.cfg("threshold", 0.5))
         mode = self.cfg("mode", "pool")
+        group_id = str(event.get_group_id() or "")
+        text = (event.message_str or "").strip()
+        msg_ref = None  # 统计记录内消息 dict 的引用，供最终裁决回写
+
+        # 正则强制触发：命中则跳过 Jev 与概率/冷却，直接交给主 LLM
+        if self._match_regex(self.cfg("force_trigger_regex", ""), text):
+            self.stats["force_triggered"] += 1
+            self.stats["triggered"] += 1
+            self._last_wake[group_id] = time.monotonic()
+            self._record(
+                _CallRecord(
+                    ts=time.time(),
+                    group_id=group_id,
+                    mode="force",
+                    latency_ms=0.0,
+                    model=self.cfg("model", "jev-latest"),
+                    usage={},
+                    messages=[
+                        {
+                            "text": text,
+                            "sender": event.get_sender_name(),
+                            "noul": 1.0,
+                            "triggered": True,
+                            "force": True,
+                        }
+                    ],
+                    error=None,
+                )
+            )
+            event.is_at_or_wake_command = True
+            self._schedule_react(event)
+            if self.cfg("log_decisions", False):
+                logger.info("[intentiontrigger] ⚡ 正则强制触发: %r", text)
+            return
 
         if mode == "single":
             text = (event.message_str or "").strip()
@@ -664,26 +779,26 @@ class IntentionTrigger(Star):
                     event.is_at_or_wake_command = True
                 return
             trig = score >= threshold
-            self._record(
-                _CallRecord(
-                    ts=time.time(),
-                    group_id=str(event.get_group_id() or ""),
-                    mode="single",
-                    latency_ms=(time.monotonic() - t0) * 1000,
-                    model=self.cfg("model", "jev-latest"),
-                    usage=usage,
-                    messages=[
-                        {
-                            "text": text,
-                            "sender": event.get_sender_name(),
-                            "noul": round(score, 4),
-                            "triggered": trig,
-                            "category": category,
-                        }
-                    ],
-                    error=None,
-                )
+            record = _CallRecord(
+                ts=time.time(),
+                group_id=str(event.get_group_id() or ""),
+                mode="single",
+                latency_ms=(time.monotonic() - t0) * 1000,
+                model=self.cfg("model", "jev-latest"),
+                usage=usage,
+                messages=[
+                    {
+                        "text": text,
+                        "sender": event.get_sender_name(),
+                        "noul": round(score, 4),
+                        "triggered": trig,
+                        "category": category,
+                    }
+                ],
+                error=None,
             )
+            self._record(record)
+            msg_ref = record.messages[0]
         else:
             loop = asyncio.get_running_loop()
             entry = _PoolEntry(
@@ -698,16 +813,48 @@ class IntentionTrigger(Star):
                 if self.cfg("on_error", "suppress") == "pass_to_llm":
                     event.is_at_or_wake_command = True
                 return
-            score, trig, category = result
+            score, trig, category, msg_ref = result
             if score < 0:  # API 错误（on_error 已在 flush 端处理 pass_through 语义）
                 if trig:
                     event.is_at_or_wake_command = True
                 return
 
+        # 最终裁决：唤醒概率 → 群冷却（force 路径已在上方提前返回）
+        note = None
+        if trig:
+            raw_prob = self.cfg("trigger_probability", 1.0)
+            probability = 1.0 if raw_prob is None else float(raw_prob)
+            probability = min(max(probability, 0.0), 1.0)
+            if probability < 1.0 and random.random() >= probability:
+                trig = False
+                note = "probability"
+                self.stats["probability_suppressed"] += 1
+                if self.cfg("log_decisions", False):
+                    logger.info(
+                        "[intentiontrigger] 🎲 概率抑制 (score=%.3f 通过但概率 %.2f 未命中): %r",
+                        score,
+                        probability,
+                        text,
+                    )
+        if trig and self._cooldown_active(group_id):
+            trig = False
+            note = "cooldown"
+            self.stats["cooldown_suppressed"] += 1
+            if self.cfg("log_decisions", False):
+                logger.info("[intentiontrigger] ❄️ 冷却抑制: %r", text)
+
+        # 回写统计记录，让统计页反映最终裁决（含概率/冷却抑制）
+        if msg_ref is not None:
+            msg_ref["triggered"] = trig
+            if note:
+                msg_ref["note"] = note
+
         if trig:
             self.stats["triggered"] += 1
+            self._last_wake[group_id] = time.monotonic()
             # 关键一步：让 ProcessStage 把这条消息当作被唤醒的消息交给主 LLM
             event.is_at_or_wake_command = True
+            self._schedule_react(event)
             # 意图分类供 on_llm_request 钩子追加风格提示
             if category and category in CATEGORY_CRITERIA and category != "not_addressed":
                 event.set_extra("intention_category", category)
@@ -719,7 +866,11 @@ class IntentionTrigger(Star):
                     category,
                     event.message_str,
                 )
-        else:
+        elif note is not None:
+            # 概率/冷却抑制：消息本身有意图，不计低分抑制，也不拦截其他插件
+            pass
+        elif score is not None and score >= 0:
+            # 只统计走完 Jev 判定且分数为正的低分抑制（API 错误路径分数为 -1，不计）
             self.stats["suppressed"] += 1
             if self.cfg("log_decisions", False):
                 logger.info(
@@ -871,6 +1022,20 @@ class IntentionTrigger(Star):
                 "triggered": self.stats["triggered"],
                 "suppressed": self.stats["suppressed"],
                 "errors": self.stats["errors"],
+                "short_ignored": self.stats["short_ignored"],
+                "probability_suppressed": self.stats["probability_suppressed"],
+                "cooldown_suppressed": self.stats["cooldown_suppressed"],
+                "force_triggered": self.stats["force_triggered"],
+            },
+            "gate_settings": {
+                "min_text_length": int(self.cfg("min_text_length", 3) or 0),
+                "trigger_probability": float(self.cfg("trigger_probability", 1.0) or 1.0),
+                "group_cooldown_seconds": float(
+                    self.cfg("group_cooldown_seconds", 0) or 0
+                ),
+                "react_on_trigger": bool(self.cfg("react_on_trigger", False)),
+                "force_trigger_regex": self.cfg("force_trigger_regex", "") or "",
+                "force_suppress_regex": self.cfg("force_suppress_regex", "") or "",
             },
         }
 
@@ -1043,6 +1208,7 @@ class IntentionTrigger(Star):
             ov = self._overview()
             c, t = ov["config"], ov["totals"]
             cost = ov["costs"]
+            s = ov["since_restart"]
             lines = [
                 f"启用: {self.cfg('enable', True)}  模式: {c['mode']}"
                 + (
@@ -1061,6 +1227,8 @@ class IntentionTrigger(Star):
                     if t["avg_latency_ms"] is not None
                     else ""
                 ),
+                f"唤醒控制: 过短忽略 {s['short_ignored']} / 概率抑制 {s['probability_suppressed']}"
+                f" / 冷却抑制 {s['cooldown_suppressed']} / 正则强制 {s['force_triggered']}",
                 f"花费(近期): in={cost['input_tokens']} tok / out={cost['output_tokens']} tok"
                 f" ≈ ${cost['est_cost_usd']:.4f}",
                 "详细统计页: WebUI → 插件 → astrbot_plugin_intentiontrigger → 统计页",

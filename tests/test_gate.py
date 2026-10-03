@@ -82,6 +82,32 @@ class FakeEvent:
         return self._stopped
 
 
+class FakeBot:
+    def __init__(self):
+        self.actions = []
+
+    async def call_action(self, action, **kwargs):
+        self.actions.append((action, kwargs))
+
+
+class FakeMsgObj:
+    def __init__(self, message_id="MSG1"):
+        self.message_id = message_id
+
+
+def make_aiocqhttp_event(**kwargs):
+    """带 bot/message_obj 的 aiocqhttp 平台事件（贴表情测试用）。"""
+    ev = FakeEvent(**kwargs)
+
+    def get_platform_name():
+        return "aiocqhttp"
+
+    ev.get_platform_name = get_platform_name
+    ev.bot = FakeBot()
+    ev.message_obj = FakeMsgObj()
+    return ev
+
+
 class FakeContext:
     def get_config(self):
         return {"platform_settings": {"rate_limit": {"count": 0, "time": 60}}}
@@ -345,6 +371,106 @@ async def main() -> int:
           f"{len(content_lines)} 行")
     check("轮转: 计数已重置", p8._stats_lines == 6)
     p8._stats_file = None
+
+    # ---------------- 唤醒控制：过短忽略 ----------------
+    p_len = make_plugin({"min_text_length": 3})
+    await p_len.initialize()
+    check("过短忽略: 1 字消息不进判定", not p_len.should_gate(FakeEvent(text="6")))
+    check("过短忽略: 2 字消息不进判定", not p_len.should_gate(FakeEvent(text="在吗")))
+    check("过短忽略: 3 字消息正常判定", p_len.should_gate(FakeEvent(text="在吗在吗")))
+    p_len0 = make_plugin({"min_text_length": 0})
+    await p_len0.initialize()
+    check("过短忽略: 设 0 关闭", p_len0.should_gate(FakeEvent(text="6")))
+
+    # ---------------- 唤醒控制：正则强制触发/抑制 ----------------
+    p_re = make_plugin({"force_trigger_regex": r"鸭嘴兽|出来干活"})
+    await p_re.initialize()
+    CALLS["n"] = 0
+    SINGLE_NOUL["v"] = 0.0  # 即使 Jev 会判 0，正则也应直接放行
+    ev_force = FakeEvent(text="鸭嘴兽出来干活了")
+    await p_re.gate_group_message(ev_force)
+    check("正则强制触发: 命中直接放行", ev_force.is_at_or_wake_command is True)
+    check("正则强制触发: 未消耗 API 调用", CALLS["n"] == 0, f"calls={CALLS['n']}")
+    check("正则强制触发: 统计 force_triggered=1",
+          p_re.stats["force_triggered"] == 1)
+    ev_noforce = FakeEvent(text="今天天气不错")
+    SINGLE_NOUL["v"] = 0.0
+    await p_re.gate_group_message(ev_noforce)
+    check("正则强制触发: 未命中的消息走正常低分判定",
+          ev_noforce.is_at_or_wake_command is False)
+
+    p_sup = make_plugin({"force_suppress_regex": r"^(6|草|哈哈+)$"})
+    await p_sup.initialize()
+    check("正则强制抑制: 命中不进判定", not p_sup.should_gate(FakeEvent(text="哈哈哈")))
+    check("正则强制抑制: 未命中正常判定", p_sup.should_gate(FakeEvent(text="鸭嘴兽在吗")))
+    p_bad = make_plugin({"force_trigger_regex": "([bad"})
+    await p_bad.initialize()
+    check("正则容错: 非法表达式视为禁用", not p_bad._match_regex("([bad", "任意文本"))
+
+    # ---------------- 唤醒控制：唤醒概率 ----------------
+    CALLS["n"] = 0
+    p_prob = make_plugin({"mode": "single", "trigger_probability": 0.0,
+                          "log_decisions": True})
+    await p_prob.initialize()
+    SINGLE_NOUL["v"] = 0.95
+    ev_prob = FakeEvent(text="鸭嘴兽在吗")
+    await p_prob.gate_group_message(ev_prob)
+    check("唤醒概率: 0.0 时即使 Jev 高分也静默", ev_prob.is_at_or_wake_command is False)
+    check("唤醒概率: 统计 probability_suppressed=1",
+          p_prob.stats["probability_suppressed"] == 1)
+    check("唤醒概率: 判定记录回写 note=probability 且 triggered=False",
+          p_prob.recent_calls[-1].messages[0].get("note") == "probability"
+          and p_prob.recent_calls[-1].messages[0]["triggered"] is False)
+    check("唤醒概率: 概率抑制不计入低分抑制", p_prob.stats["suppressed"] == 0)
+    p_prob100 = make_plugin({"mode": "single", "trigger_probability": 1.0})
+    await p_prob100.initialize()
+    SINGLE_NOUL["v"] = 0.95
+    ev_ok = FakeEvent(text="鸭嘴兽在吗")
+    await p_prob100.gate_group_message(ev_ok)
+    check("唤醒概率: 1.0 时不干预", ev_ok.is_at_or_wake_command is True)
+
+    # ---------------- 唤醒控制：群冷却 ----------------
+    p_cd = make_plugin({"mode": "single", "group_cooldown_seconds": 60,
+                        "log_decisions": True})
+    await p_cd.initialize()
+    SINGLE_NOUL["v"] = 0.95
+    ev_cd1 = FakeEvent(text="第一条触发消息")
+    await p_cd.gate_group_message(ev_cd1)
+    check("群冷却: 首条正常触发", ev_cd1.is_at_or_wake_command is True)
+    ev_cd2 = FakeEvent(text="第二条触发消息")
+    await p_cd.gate_group_message(ev_cd2)
+    check("群冷却: 冷却期内第二条静默", ev_cd2.is_at_or_wake_command is False)
+    check("群冷却: 统计 cooldown_suppressed=1",
+          p_cd.stats["cooldown_suppressed"] == 1)
+    check("群冷却: 判定记录回写 note=cooldown",
+          p_cd.recent_calls[-1].messages[0].get("note") == "cooldown")
+
+    # ---------------- 唤醒控制：贴表情 ----------------
+    p_react = make_plugin({"mode": "single", "react_on_trigger": True,
+                           "react_emoji": "128077"})
+    await p_react.initialize()
+    SINGLE_NOUL["v"] = 0.95
+    ev_react = make_aiocqhttp_event(text="鸭嘴兽在吗")
+    await p_react.gate_group_message(ev_react)
+    await asyncio.sleep(0.1)
+    check("贴表情: 触发消息调用了 set_msg_emoji_like",
+          len(ev_react.bot.actions) == 1
+          and ev_react.bot.actions[0][0] == "set_msg_emoji_like"
+          and ev_react.bot.actions[0][1]["emoji_code"] == "128077",
+          str(ev_react.bot.actions))
+    ev_react2 = make_aiocqhttp_event(text="纯闲聊消息啊")
+    SINGLE_NOUL["v"] = 0.05
+    await p_react.gate_group_message(ev_react2)
+    await asyncio.sleep(0.1)
+    check("贴表情: 未触发消息不贴", len(ev_react2.bot.actions) == 0)
+
+    p_noreact = make_plugin({"mode": "single", "react_on_trigger": False})
+    await p_noreact.initialize()
+    SINGLE_NOUL["v"] = 0.95
+    ev_noreact = make_aiocqhttp_event(text="鸭嘴兽在吗")
+    await p_noreact.gate_group_message(ev_noreact)
+    await asyncio.sleep(0.1)
+    check("贴表情: 开关关闭时不贴", len(ev_noreact.bot.actions) == 0)
 
     for p in _PLUGINS:
         await p.terminate()
